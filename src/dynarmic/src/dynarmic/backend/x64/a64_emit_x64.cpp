@@ -9,6 +9,7 @@
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 
 #include <algorithm>
+#include <atomic>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 #include "common/assert.h"
@@ -1036,28 +1037,42 @@ void A64EmitX64::EmitUnlinkedExit(const IR::LocationDescriptor& target) {
     code.ForceReturnFromRunCode();
 }
 
-// Compact exits: a 5/6-byte rel32 jump to the target block, or to the target's shared exit stub
-// while unlinked. Every site gets its stub at first emission, so Unpatch always finds one.
-#define COMPACT_PATCH(JCC, SIZE)                                                                    \
-    if (conf.compact_block_exits) {                                                                 \
-        if (emitting_block) {                                                                       \
-            EnsureExitStub(target_desc);                                                            \
-        }                                                                                           \
-        if (target_code_ptr) {                                                                      \
-            code.JCC(target_code_ptr);                                                              \
-        } else if (const auto it = exit_stubs.find(target_desc.Value()); it != exit_stubs.end()) { \
-            code.JCC(it->second);                                                                   \
-        } else {                                                                                    \
-            ASSERT(emitting_block);                                                                 \
-            code.JCC(*PendingExitStub(target_desc), code.T_NEAR);                                   \
-        }                                                                                           \
-        code.EnsurePatchLocationSize(patch_location, SIZE);                                         \
-        return;                                                                                     \
+void A64EmitX64::RelinkCompactPatch(const u8* displacement, const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
+    if (!target_code_ptr) {
+        target_code_ptr = exit_stubs.at(target_desc.Value());
+    }
+    const s64 rel = static_cast<const u8*>(target_code_ptr) - (displacement + 4);
+    ASSERT(rel == s64(s32(rel)));
+    std::atomic_ref<u32>{*reinterpret_cast<u32*>(const_cast<u8*>(displacement))}.store(u32(s32(rel)), std::memory_order_relaxed);
+}
+
+// Compact exits: a rel32 jump to the target block, or to the target's shared exit stub while
+// unlinked. Every site gets its stub at first emission, so Unpatch always finds one. Nops in front
+// align the displacement to 4 bytes: relinking stores only it, in one store that code running on
+// other threads sees whole.
+#define COMPACT_PATCH(JCC, OPCODE_SIZE, ...)                                                                        \
+    if (conf.compact_block_exits) {                                                                              \
+        const size_t pad = (4 - (reinterpret_cast<uintptr_t>(patch_location) + OPCODE_SIZE) % 4) % 4;            \
+        if (!emitting_block) {                                                                                   \
+            RelinkCompactPatch(static_cast<const u8*>(patch_location) + pad + OPCODE_SIZE, target_desc, target_code_ptr); \
+            return;                                                                                              \
+        }                                                                                                        \
+        EnsureExitStub(target_desc);                                                                             \
+        code.nop(pad);                                                                                           \
+        if (target_code_ptr) {                                                                                   \
+            code.JCC(target_code_ptr __VA_OPT__(,) __VA_ARGS__);                                                           \
+        } else if (const auto it = exit_stubs.find(target_desc.Value()); it != exit_stubs.end()) {              \
+            code.JCC(it->second __VA_OPT__(,) __VA_ARGS__);                                                                \
+        } else {                                                                                                 \
+            code.JCC(*PendingExitStub(target_desc), code.T_NEAR);                                                \
+        }                                                                                                        \
+        ASSERT(code.getCurr<const u8*>() == static_cast<const u8*>(patch_location) + pad + OPCODE_SIZE + 4);    \
+        return;                                                                                                  \
     }
 
 void A64EmitX64::EmitPatchJg(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
     const CodePtr patch_location = code.getCurr();
-    COMPACT_PATCH(jg, 6)
+    COMPACT_PATCH(jg, 2)
     if (target_code_ptr) {
         code.jg(target_code_ptr);
     } else {
@@ -1070,7 +1085,7 @@ void A64EmitX64::EmitPatchJg(const IR::LocationDescriptor& target_desc, CodePtr 
 
 void A64EmitX64::EmitPatchJz(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
     const CodePtr patch_location = code.getCurr();
-    COMPACT_PATCH(jz, 6)
+    COMPACT_PATCH(jz, 2)
     if (target_code_ptr) {
         code.jz(target_code_ptr);
     } else {
@@ -1083,7 +1098,7 @@ void A64EmitX64::EmitPatchJz(const IR::LocationDescriptor& target_desc, CodePtr 
 
 void A64EmitX64::EmitPatchJmp(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr) {
     const CodePtr patch_location = code.getCurr();
-    COMPACT_PATCH(jmp, 5)
+    COMPACT_PATCH(jmp, 1, code.T_NEAR)
     if (target_code_ptr) {
         code.jmp(target_code_ptr);
     } else {
