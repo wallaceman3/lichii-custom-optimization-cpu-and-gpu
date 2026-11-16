@@ -388,7 +388,9 @@ jobs:
       - name: Stop sccache on Windows
         if: always() && startsWith(matrix.platform, 'windows') && steps.compiler-cache.outcome == 'success'
         shell: pwsh
-        run: sccache --stop-server
+        run: |
+          try { sccache --stop-server } catch {}
+          exit 0
 
       - name: Save compiler objects
         if: always() && steps.compiler-cache.outcome == 'success'
