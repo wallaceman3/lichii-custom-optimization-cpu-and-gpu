@@ -20,6 +20,7 @@
 #include "dynarmic/backend/x64/a64_jitstate.h"
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/devirtualize.h"
+#include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #include "dynarmic/backend/x64/jitstate_info.h"
 #include "dynarmic/common/atomic.h"
 #include "dynarmic/frontend/A64/translate/a64_translate.h"
@@ -33,7 +34,7 @@ using namespace Backend::X64;
 
 static RunCodeCallbacks GenRunCodeCallbacks(A64::UserCallbacks* cb, CodePtr (*LookupBlock)(void* lookup_block_arg), void* arg, const A64::UserConfig& conf) {
     return RunCodeCallbacks{
-        ArgCallback(LookupBlock, reinterpret_cast<u64>(arg)),
+        ArgCallback(LookupBlock, reinterpret_cast<u64>(arg)).ArgFromJitState(offsetof(A64JitState, jit_impl), reinterpret_cast<u64>(arg)),
         ArgCallback(Devirtualize<&A64::UserCallbacks::AddTicks>(cb)),
         ArgCallback(Devirtualize<&A64::UserCallbacks::GetTicksRemaining>(cb)),
         conf.enable_cycle_counting,
@@ -89,6 +90,7 @@ public:
         if (!conf.enable_avx2) {
             block_of_code.DisableHostFeature(HostFeature::AVX2);
         }
+        InitJitStatePointers();
     }
 
     ~Impl() = default;
@@ -140,6 +142,7 @@ public:
     void Reset() {
         ASSERT(!is_executing);
         jit_state = {};
+        InitJitStatePointers();
     }
 
     void HaltExecution(HaltReason hr) {
@@ -246,6 +249,19 @@ public:
     }
 
 private:
+    void InitJitStatePointers() {
+        jit_state.callbacks = std::bit_cast<u64>(conf.callbacks);
+        jit_state.jit_impl = std::bit_cast<u64>(this);
+        jit_state.user_config = std::bit_cast<u64>(&conf);
+        jit_state.tpidr_el0 = std::bit_cast<u64>(conf.tpidr_el0);
+        jit_state.tpidrro_el0 = std::bit_cast<u64>(conf.tpidrro_el0);
+        if (conf.global_monitor) {
+            jit_state.exclusive_address = std::bit_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id));
+            jit_state.exclusive_value = std::bit_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id));
+        }
+        jit_state.fast_dispatch_table = std::bit_cast<u64>(emitter.fast_dispatch_table.data());
+    }
+
     static CodePtr GetCurrentBlockThunk(void* thisptr) {
         Jit::Impl* this_ = static_cast<Jit::Impl*>(thisptr);
         return this_->GetCurrentBlock();
