@@ -162,6 +162,8 @@ public:
     void FlushPendingExitStubs();
     /// Leaves the block for `target` without linking: stores the PC and returns to the dispatcher.
     void EmitUnlinkedExit(const IR::LocationDescriptor& target);
+    /// Points the compact exit whose rel32 is at `displacement` to the block, or its exit stub.
+    void RelinkCompactPatch(const u8* displacement, const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr);
     std::vector<FastmemPatchInfo> fastmem_patch_info;  // sorted by rip
     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> read_fallbacks;
     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;
