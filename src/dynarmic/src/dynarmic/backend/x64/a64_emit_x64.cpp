@@ -63,7 +63,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
         size_t bits = conf.fast_dispatch_table_bits != 0 ? conf.fast_dispatch_table_bits : default_fast_dispatch_table_bits;
         bits = std::clamp<size_t>(bits, 8, 24);
         fast_dispatch_set_size = conf.fast_dispatch_set_associative ? fast_dispatch_ways : 1;
-        fast_dispatch_table.resize(size_t(1) << bits);
+        fast_dispatch_table_size = size_t(1) << bits;
         fast_dispatch_table_mask = u32(((size_t(1) << bits) - 1) * sizeof(FastDispatchEntry)) & ~u32(fast_dispatch_set_size * sizeof(FastDispatchEntry) - 1);
     }
     code.elide_redundant_zext = conf.elide_redundant_zext;
@@ -74,7 +74,6 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
     GenFastmemFallbacks();
     GenTerminalHandlers();
     code.PreludeComplete();
-    ClearFastDispatchTable();
 
     if (conf.fastmem_pointer.has_value()) {
         exception_handler.SetFastmemCallback([this](u64 rip_) {
@@ -267,18 +266,13 @@ void A64EmitX64::ClearCache() {
     exit_stubs.clear();
     pending_exit_stubs.clear();
     block_ranges.ClearCache();
-    ClearFastDispatchTable();
     fastmem_patch_info.clear();
 }
 
-void A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
-    InvalidateBasicBlocks(block_ranges.InvalidateRanges(ranges));
-}
-
-void A64EmitX64::ClearFastDispatchTable() {
-    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
-        std::fill(fast_dispatch_table.begin(), fast_dispatch_table.end(), FastDispatchEntry{});
-    }
+bool A64EmitX64::InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges) {
+    const auto blocks = block_ranges.InvalidateRanges(ranges);
+    InvalidateBasicBlocks(blocks);
+    return !blocks.empty();
 }
 
 void A64EmitX64::GenTerminalHandlers() {
@@ -368,17 +362,6 @@ void A64EmitX64::GenTerminalHandlers() {
         code.mov(ptr[r12 + offsetof(FastDispatchEntry, code_ptr)], rax);
         code.jmp(rax);
         PerfMapRegister(terminal_handler_fast_dispatch_hint, code.getCurr(), "a64_terminal_handler_fast_dispatch_hint");
-
-        code.align();
-        fast_dispatch_table_lookup = code.getCurr<FastDispatchEntry& (*)(u64)>();
-        code.mov(code.ABI_PARAM2, u64(fast_dispatch_table.data()));
-        if (code.HasHostFeature(HostFeature::SSE42)) {
-            code.crc32(code.ABI_PARAM1, code.ABI_PARAM2);
-        }
-        code.and_(code.ABI_PARAM1.cvt32(), fast_dispatch_table_mask);
-        code.lea(code.ABI_RETURN, code.ptr[code.ABI_PARAM2 + code.ABI_PARAM1]);
-        code.ret();
-        PerfMapRegister(fast_dispatch_table_lookup, code.getCurr(), "a64_fast_dispatch_table_lookup");
     }
 }
 
@@ -1118,20 +1101,6 @@ void A64EmitX64::EmitPatchMovRcx(CodePtr target_code_ptr) {
     const CodePtr patch_location = code.getCurr();
     code.mov(code.rcx, u64(target_code_ptr));
     code.EnsurePatchLocationSize(patch_location, 10);
-}
-
-void A64EmitX64::Unpatch(const IR::LocationDescriptor& location) {
-    EmitX64::Unpatch(location);
-    if (conf.HasOptimization(OptimizationFlag::FastDispatch)) {
-        code.DisableWriting();
-        FastDispatchEntry* const set = &(*fast_dispatch_table_lookup)(location.Value());
-        for (size_t way = 0; way < fast_dispatch_set_size; ++way) {
-            if (set[way].location_descriptor == location.Value()) {
-                set[way] = {};
-            }
-        }
-        code.EnableWriting();
-    }
 }
 
 }  // namespace Dynarmic::Backend::X64

@@ -58,7 +58,8 @@ public:
 
     void ClearCache() override;
 
-    void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
+    /// Returns whether a block was dropped.
+    bool InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
 
 //protected:
     struct FastDispatchEntry {
@@ -70,7 +71,6 @@ public:
     /// Entries per set when conf.fast_dispatch_set_associative (one 64-byte cache line).
     static constexpr size_t fast_dispatch_ways = 4;
 
-    void ClearFastDispatchTable();
     void GenMemory128Accessors();
     void GenFastmemFallbacks();
     void GenTerminalHandlers();
@@ -129,7 +129,6 @@ public:
     bool EmitTerminal(IR::Term::Terminal const& terminal, IR::LocationDescriptor initial_location, bool is_single_step) noexcept override;
 
     // Patching
-    void Unpatch(const IR::LocationDescriptor& target_desc) override;
     void EmitPatchJg(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr = nullptr) override;
     void EmitPatchJz(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr = nullptr) override;
     void EmitPatchJmp(const IR::LocationDescriptor& target_desc, CodePtr target_code_ptr = nullptr) override;
@@ -139,7 +138,9 @@ public:
     const A64::UserConfig conf;
     RegAlloc reg_alloc; //reusable reg alloc
     BlockRangeInformation<u64> block_ranges;
-    std::vector<FastDispatchEntry> fast_dispatch_table;
+    /// Entries of each Jit's fast dispatch table (A64JitState::fast_dispatch_table). A Jit clears
+    /// its own when the code cache's epoch moves, so invalidation does not touch them.
+    size_t fast_dispatch_table_size = 0;
     /// Byte offset mask of a set (or entry) in fast_dispatch_table.
     u32 fast_dispatch_table_mask = 0;
     size_t fast_dispatch_set_size = 1;
@@ -172,7 +173,6 @@ public:
     boost::container::stable_vector<Xbyak::Label> shared_labels;
     const void* terminal_handler_pop_rsb_hint = nullptr;
     const void* terminal_handler_fast_dispatch_hint = nullptr;
-    FastDispatchEntry& (*fast_dispatch_table_lookup)(u64) = nullptr;
     A64::Jit* jit_interface = nullptr;
     void (*memory_read_128)() = nullptr;
     void (*memory_write_128)() = nullptr;
