@@ -103,6 +103,12 @@ public:
     void AddFastmemPatch(CodePtr location, CodePtr resume_location, void (*callback)(), const DoNotFastmemMarker& marker, bool recompile);
     std::optional<FakeCall> FastmemCallback(u64 rip);
 
+    // The running Jit's objects, loaded from the JIT state so the code serves every Jit
+    ArgCallback JitCallback(const ArgCallback& cb) const;
+    void EmitUserConfigPointer(Xbyak::Reg64 reg);
+    void EmitExclusiveAddressPointer(Xbyak::Reg64 reg);
+    void EmitExclusiveValuePointer(Xbyak::Reg64 reg);
+
     // Memory access helpers
     void EmitCheckMemoryAbort(A64EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);
     template<std::size_t bitsize, auto callback>
