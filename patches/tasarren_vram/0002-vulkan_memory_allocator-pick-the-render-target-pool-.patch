@@ -1,0 +1,28 @@
+From 035fd718d20999b977d2d2fcb831523e5ec19d06 Mon Sep 17 00:00:00 2001
+From: Tasa <tasarren@underaft.com>
+Date: Sat, 14 Nov 2026 20:10:14 +0100
+Subject: [PATCH 2/3] vulkan_memory_allocator: pick the render target pool's
+ type with the image's usage
+
+vmaFindMemoryTypeIndex has no resource usage, so VMA refuses AUTO_PREFER_DEVICE and the pool was never created.
+---
+ src/video_core/vulkan_common/vulkan_memory_allocator.cpp | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index c0dae75fed..d858fd3825 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -476,8 +476,7 @@ bool MemoryAllocator::CreateImageInSeparatePool(const VkImageCreateInfo& ci,
+     const VkMemoryRequirements requirements = device.GetLogical().GetImageMemoryRequirements(image);
+     u32 memory_type{};
+     if (requirements.size <= Device::SeparatePoolBlockSize / 2 &&
+-        vmaFindMemoryTypeIndex(allocator, requirements.memoryTypeBits, &alloc_ci, &memory_type) ==
+-            VK_SUCCESS) {
++        vmaFindMemoryTypeIndexForImageInfo(allocator, &ci, &alloc_ci, &memory_type) == VK_SUCCESS) {
+         if (const VmaPool pool =
+                 device.GetSeparatePool(Device::SeparatePool::RenderTargets, memory_type)) {
+             VmaAllocationCreateInfo pool_ci = alloc_ci;
+-- 
+2.56.0.windows.4
+

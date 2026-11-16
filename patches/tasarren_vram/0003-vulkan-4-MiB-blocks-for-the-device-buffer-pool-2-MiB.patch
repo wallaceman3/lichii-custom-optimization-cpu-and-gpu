@@ -1,0 +1,56 @@
+From 689644bc4f879e5efcf622108ec65c7e917243ef Mon Sep 17 00:00:00 2001
+From: Tasa <tasarren@underaft.com>
+Date: Sat, 14 Nov 2026 20:25:00 +0100
+Subject: [PATCH 3/3] vulkan: 4 MiB blocks for the device buffer pool, 2 MiB
+ cut-off
+
+---
+ src/video_core/vulkan_common/vulkan_device.cpp           | 3 ++-
+ src/video_core/vulkan_common/vulkan_device.h             | 3 +++
+ src/video_core/vulkan_common/vulkan_memory_allocator.cpp | 2 +-
+ 3 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index 7bea1df6a2..1bef9fdba0 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -1122,7 +1122,8 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type, bool create)
+         const VmaPoolCreateInfo ci{
+             .memoryTypeIndex = memory_type,
+             .flags = 0,
+-            .blockSize = SeparatePoolBlockSize,
++            .blockSize = kind == SeparatePool::DeviceBuffers ? DeviceBufferBlockSize
++                                                             : SeparatePoolBlockSize,
+             .minBlockCount = 0,
+             .maxBlockCount = 0,
+             .priority = 0.f,
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index 6788ce0f47..3c0c9f7bac 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -294,6 +294,9 @@ public:
+         Count,
+     };
+     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
++    /// DeviceBuffers: buffer cache buffers live a few per block, so 16 MiB blocks stayed pinned
++    /// mostly empty.
++    static constexpr VkDeviceSize DeviceBufferBlockSize = 4ULL << 20;
+ 
+     /// The pool of that kind for a memory type, created on first use unless !create (null if
+     /// that failed or it doesn't exist).
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index d858fd3825..74bfd1c1d6 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -502,7 +502,7 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
+                                                  VmaAllocationInfo& alloc_info) const {
+     // The buffer cache's buffers, churned by its collector: in a pool of their own (see
+     // Device::SeparatePool). Anything over half a block takes the default blocks (dedicated).
+-    if (usage != MemoryUsage::DeviceLocal || ci.size > Device::SeparatePoolBlockSize / 2) {
++    if (usage != MemoryUsage::DeviceLocal || ci.size > Device::DeviceBufferBlockSize / 2) {
+         return false;
+     }
+     u32 memory_type{};
+-- 
+2.56.0.windows.4
+

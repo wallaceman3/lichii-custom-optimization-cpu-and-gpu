@@ -12,8 +12,10 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/common_types.h"
@@ -21,14 +23,17 @@
 
 namespace VideoCommon {
 
-/// NeedNow: a draw or dispatch waits for it. Soon: bound but not drawn yet, or a boot build of a
-/// used pipeline. Background: prebuild, precache, relowering, migration.
+/// NeedNow: a draw or dispatch waits for it.
+/// Vip: gameplay essential (compute physics/lighting, solid geometry with depth write).
+/// Soon: gameplay standard (transparent particles, smoke, dust, FX, boot used pipelines).
+/// Background: prebuild, precache, relowering, migration.
 enum class ShaderJobPriority : u8 {
     NeedNow,
+    Vip,
     Soon,
     Background,
 };
-inline constexpr size_t NumShaderJobPriorities = 3;
+inline constexpr size_t NumShaderJobPriorities = 4;
 
 enum class ShaderJobStatus : u8 {
     Queued,       ///< Waiting for a CPU worker, or for the memory budget
@@ -156,6 +161,50 @@ public:
     /// A job submitted after Shutdown, or with a stopped batch, is cancelled at once.
     ShaderJobHandle Submit(ShaderJob job, const ShaderJobBatch* batch = nullptr);
 
+    /// Submits a batch of jobs in a single critical section and single notification.
+    std::vector<ShaderJobHandle> Submit(std::span<ShaderJob> jobs,
+                                        const ShaderJobBatch* batch = nullptr);
+    std::vector<ShaderJobHandle> Submit(std::vector<ShaderJob>&& jobs,
+                                        const ShaderJobBatch* batch = nullptr) {
+        return Submit(std::span<ShaderJob>{jobs}, batch);
+    }
+
+    /// RAII scope that defers thread notifications until the scope exits, coalescing multiple
+    /// Submits into a single notification.
+    class [[nodiscard]] BatchScope {
+    public:
+        explicit BatchScope(ShaderJobScheduler* scheduler_) : scheduler{scheduler_} {
+            if (scheduler) {
+                scheduler->EnterBatch();
+            }
+        }
+        ~BatchScope() {
+            if (scheduler) {
+                scheduler->LeaveBatch();
+            }
+        }
+        BatchScope(const BatchScope&) = delete;
+        BatchScope& operator=(const BatchScope&) = delete;
+        BatchScope(BatchScope&& other) noexcept
+            : scheduler{std::exchange(other.scheduler, nullptr)} {}
+        BatchScope& operator=(BatchScope&& other) noexcept {
+            if (this != &other) {
+                if (scheduler) {
+                    scheduler->LeaveBatch();
+                }
+                scheduler = std::exchange(other.scheduler, nullptr);
+            }
+            return *this;
+        }
+
+    private:
+        ShaderJobScheduler* scheduler{};
+    };
+
+    [[nodiscard]] BatchScope BeginBatch() {
+        return BatchScope{this};
+    }
+
     ShaderJobBatch CreateBatch();
 
     /// Raises a job's priority, wherever it is queued or running. A lower priority is ignored.
@@ -196,6 +245,8 @@ private:
     void Finish(ShaderJobState& job, ShaderJobStatus status, std::vector<ShaderJob>& dead);
     void ReleaseBytes(ShaderJobState& job);
     void WakeHeldWorkers();
+    void EnterBatch();
+    void LeaveBatch();
 
     const u64 budget;
     const std::chrono::nanoseconds background_aging;
@@ -203,6 +254,9 @@ private:
     mutable std::mutex mutex;
     std::condition_variable cpu_condition;
     std::condition_variable driver_condition;
+    u32 batch_nesting{};
+    bool batch_notify_cpu{};
+    bool batch_notify_driver{};
     /// Entries go stale on promotion, cancellation or a stage start and are skipped when reached.
     Queue cpu_queue;
     Queue driver_queue;

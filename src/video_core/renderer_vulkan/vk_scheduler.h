@@ -21,6 +21,10 @@
 #include <span>
 #include <vector>
 
+#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 #include "common/alignment.h"
 #include "common/common_types.h"
 #include "common/dkb_frame_trace.h"
@@ -328,7 +332,15 @@ public:
                     }
                 }
                 while (std::chrono::steady_clock::now() < target_time) {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+                    _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+                    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+                    asm volatile("yield");
+#else
                     std::this_thread::yield();
+#endif
                 }
             }
         }

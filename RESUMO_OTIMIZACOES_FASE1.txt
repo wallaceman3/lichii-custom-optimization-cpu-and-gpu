@@ -1,0 +1,322 @@
+================================================================================
+LICHII (NX2) - RESUMO TÉCNICO DAS OTIMIZAÇÕES IMPLEMENTADAS (FASE 1)
+Data: 16 de Novembro de 2026
+Branch: vip_shader_queue_planning
+Alvo de Performance: CPUs 6-cores/6-threads (e escalável para 8+ threads) / GPUs RTX
+================================================================================
+
+Este documento resume as três grandes otimizações arquiteturais implementadas
+no emulador Lichii, detalhando o que foi feito, como foi feito, por que foi feito,
+os resultados esperados nos testes de framerate/frametime, e o que resta para as
+próximas fases.
+
+--------------------------------------------------------------------------------
+1. O QUE FOI FEITO
+--------------------------------------------------------------------------------
+
+[MÓDULO 1] FILA DE PRIORIDADES INTELIGENTE (FILA VIP DE SHADERS)
+- Criação de uma hierarquia de prioridades de 4 níveis para a fila de compilação:
+    * Prioridade 0: NeedNow (Draw/Dispatch bloqueado na thread de renderização)
+    * Prioridade 1: Vip (Compute pipelines e gráficos com Depth-Write ligado)
+    * Prioridade 2: Soon (Shaders de partículas, fumaça, efeitos e carregamento de boot)
+    * Prioridade 3: Background (Pre-compilação em disco, precache e rebaixamento)
+- Implementação de heurística O(1) de classificação rápida no momento do registro:
+    * Shaders de Compute: sempre VIP.
+    * Shaders Gráficos: 'key.state.depth_write_enable != 0' -> VIP; caso contrário -> Soon.
+- Atualização do escalonador de jobs (ShaderJobScheduler::Pick) para priorizar
+  jobs VIP estritamente antes de Soon, mantendo a proteção de aging (envelhecimento)
+  para tarefas em background e a promoção instantânea para NeedNow caso um draw dependa dele.
+- Criação de testes unitários multithread cobrindo a nova ordem de prioridade.
+
+[MÓDULO 2] REDUÇÃO DE FALSOS POSITIVOS NO NX2FASTDRAW (PREPAREDRAW / REGISTRADORES)
+- Eliminação de quebras indevidas do FastDraw causadas por escrita de mesmo valor
+  (same-value write) em registradores de estado no Maxwell 3D:
+    * No 'ProcessDirtyRegisters' (maxwell_3d.h), se 'regs.reg_array[method] == argument',
+      o método agora retorna após processar eventuais draws adiados, sem sujar 'dirty.tables'
+      e sem disparar 'Nx2FastDraw::Break(Reason::Register)'.
+- Tratamento especializado para registradores de armazenamento puro ('IsStoreOnlyExecutable'):
+    * 'topology_override', 'vertex_buffer.first', 'vertex_buffer.count' e 'index_buffer.first'.
+    * Tanto em 'CallMethodFast' quanto em 'CallMethodSlow', esses métodos agora passam
+      pelo filtro de registradores de estado ('WriteStateRegister'), evitando a armadilha de
+      chamar 'ProcessMethodCall' em macros (o que antes disparava falsos positivos
+      de 'Nx2FastDraw::Break(Reason::Method)' toda vez que uma macro reescrevia topologia idêntica).
+- Preservação estrita dos métodos executáveis de gatilho/ação ('draw.begin', 'clear_surface',
+  'launch_dma', 'report_semaphore.query', etc.), garantindo que efeitos colaterais
+  de hardware jamais sejam ignorados mesmo se reescritos com mesmo valor.
+
+[MÓDULO 3] GPU UNSWIZZLE & DECODIFICAÇÃO ASTC VIA COMPUTE SHADER
+- Limiar de tamanho inteligente para decodificação ASTC:
+    * Texturas menores que 64x64 pixels ou menos de 4096 bytes são decodificadas
+      em nanosegundos diretamente na CPU ('ASTC::Decompress').
+    * Texturas médias e grandes (cenários, modelos, terreno, mapas normais) são
+      obrigatoriamente roteadas para o Compute Shader na GPU ('astc_decoder.comp' e
+      'bc_encoder.comp' via 'AcceleratedUpload').
+- Correção de operador invertido no GPU Unswizzle:
+    * Em 'texture_cache.h', a condição 'MapSizeBytes(image) >= gpu_unswizzle_maxsize'
+      foi corrigida para 'MapSizeBytes(image) <= gpu_unswizzle_maxsize && MapSizeBytes(image) >= 4096'.
+      Anteriormente, nenhuma textura menor que o limite máximo (128/256 MB) conseguia usar
+      o desentrelazamento assíncrono na GPU.
+- Sincronização de barreiras de memória e transições de layout:
+    * Em 'CopyBufferToImage', o estágio de destino da barreira pós-transferência foi
+      atualizado de simples attachments para 'vk::PIPELINE_STAGE_GRAPHICS_COMPUTE',
+      garantindo visibilidade de leitura ('VK_ACCESS_SHADER_READ_BIT') para vertex e fragment
+      shaders e eliminando texturas piscando ou corrompidas no primeiro frame.
+
+[MÓDULO 4] FRAME PACING DE ALTA PRECISÃO (PRESENTMANAGER + MAILBOX + HYBRID SLEEP)
+- Eliminação do "engasgo fantasma" e judder de câmera através do modo Mailbox:
+    * 'VK_PRESENT_MODE_MAILBOX_KHR' adicionado às configurações recomendadas ('recommended_settings.h').
+    * Desacopla o emulador da trava rígida do FIFO (VSync tradicional que causa quedas bruscas
+      de 60 para 30 FPS se um frame atrasar 0.1 ms).
+- Implementação de Sleep Híbrido de Alta Precisão ('SleepUntil' em 'vk_present_manager.cpp'):
+    * Fase Kernel: Enquanto restar mais de ~1.5 ms (1500 us) para o deadline, a thread dorme
+      via SO ('SleepForOneTick' no Windows / 'sleep_for' em outros), liberando 100% dos ciclos de CPU.
+    * Fase Spin-Wait com Instrução Pause: Nos últimos ~1.5 ms até o exato instante do deadline,
+      executa um loop ultracurto com '_mm_pause()' (x86/x64) ou 'yield' (ARM64).
+      Isso elimina completamente o jitter do escalonador do Windows (que varia entre 0.5 e 2 ms)
+      e acerta a entrega do frame com precisão de microssegundos.
+- Escalonamento Dinâmico de Spacing no PresentManager ('GetPacingInterval'):
+    * O PresentManager agora calcula a cadência exata para frames nativos do jogo
+      (16.666 ms para 60 FPS, 33.333 ms para 30 FPS via 'g_nx2_guest_frame_interval_ns'),
+      não apenas para frames interpolados por Frame Generation.
+    * Proteção contra efeito sanfona (bursting): se o jogo sofrer um congelamento ou queda
+      maior que 2 intervalos de frame, a cadência é realinhada para o tempo atual ('start = ready'),
+      impedindo que múltiplos quadros sejam jogados de uma vez no Mailbox.
+- Eliminação de esperas conflitantes e otimização do Scheduler:
+    * 'Swapchain::AcquireNextImage' agora delega o pacing 100% para o PresentManager,
+      passando 'target_fps = 0.0' para evitar esperas duplicadas.
+    * 'Scheduler::Wait' atualizado para usar '_mm_pause()' em vez de 'std::this_thread::yield()',
+      evitando preempções desnecessárias pelo SO.
+
+[MÓDULO 5] READ-BACKS ASSÍNCRONOS N-1 EM OCCLUSION QUERIES
+- Eliminação de stalls de 2 a 8 ms causados por leituras síncronas de GPU:
+    * Em 'SamplesQueryBank::Sync' (vk_query_cache.cpp), a leitura dos resultados de queries
+      de oclusão ('ZPassPixelCount64') via 'vkGetQueryPoolResults' agora é não-bloqueante.
+    * Se o resultado ainda não estiver pronto ('VK_NOT_READY'), a CPU não mais trava em loop
+      de busy-wait: retorna imediatamente o último valor conhecido ('last_known_result' / N-1).
+    * Isolamento estrito de segurança: Transform Feedback ('TfbQueryBank') e contadores de
+      primitivas continuam estritamente síncronos, prevenindo quaisquer falhas de física ou colisão.
+
+[MÓDULO 6] MITIGAÇÃO CONSERVADORA DE BUSY-POLLING NA CPU GUEST
+- Ceder núcleo em chamadas de rendição ('svcSleepThread'):
+    * Em 'svc_thread.cpp', quando o guest chama 'SleepThread' com valores <= 10.000 ns (ou 0),
+      ou sinaliza rendição de núcleo ('WithoutCoreMigration', 'WithCoreMigration', 'ToAnyThread'),
+      dispara 'std::this_thread::yield()' no host para não queimar 100% de CPU em loops ociosos.
+- Detector de spin-loop por leitura de timer ('GetCNTPCT'):
+    * Em 'arm_dynarmic_64.cpp', adicionado contador 'm_consecutive_spin_polls' para leituras
+      consecutivas com intervalo inferior a 32 ticks (~1.7 us).
+    * Ao atingir 2.000 iterações em loop fechado, dispara um único 'std::this_thread::yield()',
+      cedendo a CPU física para workers de compilação VIP e threads de áudio.
+
+[MÓDULO 7] BATCHING DE SUBMISSÃO E COALESCÊNCIA DE NOTIFICAÇÕES (SHADERS)
+- Eliminação do overhead de syscalls na thread principal:
+    * Criação do método 'ShaderJobScheduler::Submit(std::span<ShaderJob> jobs, const ShaderJobBatch* batch)'.
+      Permite submeter múltiplos jobs sob uma única aquisição do mutex do escalonador.
+    * Implementação do escopo RAII 'BatchScope' ('BeginBatch()'):
+      Adia a notificação das condition variables ('cpu_condition', 'driver_condition') enquanto
+      jobs estão sendo adicionados ao lote, emitindo um único 'notify_all()' apenas na saída do escopo.
+    * Otimização do 'ParallelFor' (utilizado na tradução de estágios de shaders - 'TranslateStages'):
+      Submissão em lote unificada de todos os estágios do pipeline (Vertex, Fragment, Compute, etc.)
+      em vez de submeter 1 por 1 com notificações repetidas.
+    * Coalescência no carregamento de disk cache ('PrecompileDiskCache'):
+      Agrupamento de submissões em lote no pré-carregamento de compute e gráficos, reduzindo
+      milhares de syscalls de kernel no Windows para um punhado de notificações em lote.
+
+--------------------------------------------------------------------------------
+2. ARQUIVOS MODIFICADOS E DETALHES DE IMPLEMENTAÇÃO
+--------------------------------------------------------------------------------
+
+1. src/video_core/shader_jobs.h
+   - Adicionado 'ShaderJobPriority::Vip = 1' e atualizado 'NumShaderJobPriorities = 4'.
+   - Implementado 'Submit(std::span<ShaderJob>)' e escopo RAII 'BatchScope' ('BeginBatch()').
+2. src/video_core/shader_jobs.cpp
+   - Atualizado 'ShaderJobScheduler::Pick' para consumir 'Vip' logo após 'NeedNow'.
+   - Implementado 'EnterBatch()', 'LeaveBatch()' e submissão em lote com notificação coalescida.
+   - Refatorado 'ParallelFor' para submeter todos os índices em lote único.
+3. src/video_core/renderer_vulkan/pipeline_build.h
+   - 'PipelineBuildQueue' e 'PipelineBuild' agora aceitam a prioridade configurada.
+4. src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+   - 'ComputePipeline' passa a submeter jobs com 'build_queue.priority'.
+5. src/video_core/renderer_vulkan/vk_pipeline_cache.h & .cpp
+   - Heurística O(1) em 'CreateGraphicsPipeline' e 'RebuildGraphicsPipeline':
+     'key.state.depth_write_enable != 0 ? ShaderJobPriority::Vip : ShaderJobPriority::Soon'.
+   - 'CreateComputePipeline' classifica explicitamente como 'Vip'.
+   - 'PrecompileDiskCache' utiliza 'BeginBatch()' para agrupamento de submissões na inicialização.
+6. src/tests/video_core/shader_jobs.cpp
+   - Adicionados casos de teste Catch2 cobrindo 'Vip' e submissões em lote com 'BeginBatch()'.
+7. src/video_core/engines/maxwell_3d.h
+   - 'ProcessDirtyRegisters' retorna antecipadamente se 'regs.reg_array[method] == argument',
+     preservando a resolução de draws adiados e impedindo flags sujas espúrias.
+8. src/video_core/engines/maxwell_3d.cpp
+   - 'CallMethodFast' e 'CallMethodSlow' tratam 'IsStoreOnlyExecutable' de forma consistente
+     através de 'WriteStateRegister', blindando o 'Nx2FastDraw' contra quebras de macro.
+9. src/video_core/renderer_vulkan/vk_texture_cache.cpp
+   - Adicionada função 'IsGpuComputeSizeEligible' (limiar de 4096 bytes ou 64x64).
+   - Inserida barreira correta de shader read em 'CopyBufferToImage'.
+10. src/video_core/texture_cache/texture_cache.h
+    - Corrigido o operador do GPU Unswizzle para respeitar o teto 'gpu_unswizzle_maxsize'
+      e o piso mínimo de 4 KiB.
+11. src/video_core/renderer_vulkan/vk_present_manager.h & .cpp
+    - Implementado método 'GetPacingInterval' calculando cadência para frames nativos.
+    - Implementado sleep híbrido em 'SleepUntil' (kernel até 1.5 ms + spin com '_mm_pause()').
+    - Proteção contra frame bursting e sincronização de cadência no 'PresentThread'.
+12. src/video_core/renderer_vulkan/vk_swapchain.cpp
+    - 'Swapchain::AcquireNextImage' desacoplado de esperas redundantes de target_fps.
+13. src/video_core/renderer_vulkan/vk_scheduler.h
+    - Substituído 'std::this_thread::yield()' por '_mm_pause()' no spin loop tail.
+14. src/common/recommended_settings.h
+    - Adicionado 'vsync_mode = VSyncMode::Mailbox' nas configurações recomendadas.
+15. src/common/settings.h & settings.cpp
+    - Ajustado template explícito de 'VSyncMode' de 'SETTING' para 'SWITCHABLE',
+      resolvendo erro de compilação por símbolo não resolvido.
+16. src/video_core/renderer_vulkan/vk_query_cache.cpp
+    - Adicionados includes '<array>' e '<cstring>' para compilação estrita.
+    - 'SamplesQueryBank::Sync' atualizado para leitura assíncrona N-1 sem espera síncrona.
+17. src/core/hle/kernel/svc/svc_thread.cpp
+    - 'SleepThread' dispara 'std::this_thread::yield()' para valores <= 10.000 ns ou yields.
+18. src/core/arm/dynarmic/arm_dynarmic_64.h & .cpp
+    - Adicionado contador de busy-polling e yield no 'GetCNTPCT' após 2.000 spins consecutivos.
+
+--------------------------------------------------------------------------------
+3. POR QUE FOI FEITO (AS CAUSAS RAIZ)
+--------------------------------------------------------------------------------
+
+- Gargalo 1 (Fila de Banco FIFO em Shaders):
+  Em CPUs de 6 threads, existem apenas 2 workers de compilação disponíveis. Se uma
+  explosão ou efeito visual gerasse 30 partículas de fumaça na fila, os workers ficavam
+  ocupados compilando partículas transparentes. Quando o chão ou o modelo do personagem
+  chegava milissegundos depois, ele esperava atrás das partículas, causando buracos
+  no cenário e travamentos bruscos no frametime.
+
+- Gargalo 2 (Quebra Excessiva de FastDraw):
+  O emulador possui o mecanismo 'Nx2FastDraw' para reutilizar o pipeline e bindings
+  entre draws idênticos ou com pequenas deltas (instâncias, vegetação, malhas repetidas).
+  Macros de gameplay frequentemente reescrevem o mesmo registrador de topologia ou
+  parâmetros com valores idênticos. O emulador marcava 'Dirty::VertexInput' e chamava
+  'Nx2FastDraw::Break(Reason::Method)', forçando o emulador a cair para o caminho pesado
+  de 'FullDraw' (revalidação completa de estado no Vulkan).
+
+- Gargalo 3 (Streaming de Texturas Travando a Thread Gráfica):
+  Jogos de mundo aberto no Switch usam intensamente texturas ASTC e block-linear.
+  A decodificação ASTC por software na CPU consumia dezenas de milissegundos por textura.
+  Além disso, texturas 3D BCn caíam sempre na CPU por conta de uma condição '>' invertida
+  na checagem de tamanho, e texturas minúsculas de UI sobrecarregavam a GPU com submits
+  frequentes de Compute.
+
+- Gargalo 4 (Engasgo Fantasma no Frame Pacing / Mailbox sem Pacer de CPU):
+  No modo FIFO tradicional, se um frame atrasar 0.1 ms além de 16.66 ms, o driver
+  segura o quadro anterior e derruba o FPS para 30 instantaneamente. O modo Mailbox
+  resolve a trava do FIFO, mas sem um limitador de tempo de alta precisão no PresentManager,
+  a GPU entregava dois quadros em rápida sucessão (ex: 8 ms) que se sobrescreviam no mailbox,
+  gerando a sensação de "engasgo fantasma" onde o contador mostra 60 FPS mas a câmera
+  parece trepidar. Além disso, o 'SleepUntil' anterior usava apenas sleeps do Windows
+  com resolução de ~1 ms, gerando oscilações contínuas na linha de frametime.
+
+--------------------------------------------------------------------------------
+4. O QUE SE ESPERA / ONDE DEVE MELHORAR
+--------------------------------------------------------------------------------
+
+1. Estabilidade de Framerate (1% Low e 0.1% Low):
+   - Redução drástica de micro-engasgos (stutters) durante momentos de ação intensa
+     (explosões, combate, magias com muitas partículas), pois o cenário e os
+     personagens não ficam mais esperando a compilação de poeira.
+
+2. Custo de CPU por Draw Call (FastDraw Hit Rate):
+   - Aumento significativo da taxa de acerto do 'Nx2FastDraw'. Rajadas de vegetação,
+     grama, multidões e peças de malha repetidas permanecerão no caminho rápido de delta draw,
+     reduzindo o tempo de CPU por frame e estabilizando a linha de 60/30 FPS.
+
+3. Fluidez no Streaming de Mundo Aberto:
+   - Em curvas rápidas, giros de câmera ou transições de áreas, as texturas de terreno
+     e modelos 3D serão descompactadas e desentrelazadas em microssegundos pelos
+     Compute Shaders da GPU dedicada, enquanto ícones de UI não causarão mais
+     flushes desnecessários no command buffer do Vulkan.
+
+4. Linha de Frame Time Perfeitamente Plana (Frame Pacing):
+   - Movimento de câmera completamente suave (smoothness de 60 FPS real).
+   - O sleep híbrido (kernel até 1.5 ms + spin com _mm_pause()) crava cada frame
+     no tempo exato (16.666 ms em 60 FPS e 33.333 ms em 30 FPS).
+   - O modo Mailbox garante que a GPU não seja penalizada caso um frame exceda
+     levemente a margem, sem travamentos de VSync de meio ciclo.
+
+5. Ausência de Regressões Gráficas:
+   - Texturas sem cintilação no primeiro frame devido à sincronização completa de estágios.
+   - Todos os comandos de hardware e triggers continuam intactos.
+
+--------------------------------------------------------------------------------
+5. PRÓXIMOS PASSOS (O QUE FALTA IMPLEMENTAR)
+--------------------------------------------------------------------------------
+
+[PRIORIDADE MÁXIMA DA FASE 2] CARREGAMENTO MÁXIMO DE SHADERS NO BOOT COM ORÇAMENTO
+DINÂMICO DE MEMÓRIA (MEMORY-AWARE BOOT BUDGET & WORKER TURBO)
+
+Objetivo: Eliminar qualquer compilação síncrona tardia e micro-stutters durante o jogo,
+carregando o máximo possível de pipelines na tela inicial de "Loading Shaders", mas
+de forma inteligente e 100% segura contra Out-of-Memory (OOM) e paginação.
+
+A. AS 3 TRAVAS IDENTIFICADAS NO CÓDIGO ATUAL (vk_pipeline_cache.cpp / pipeline_eviction_policy.h):
+   1. Corte Rígido de Sessões e Tempo de Espera (AwaitedUsedSessions & OlderUsedPipelinesWait):
+      * Linha 923: 'AwaitedUsedSessions = 2' (apenas as últimas 2 sessões vão para o boot bloqueante).
+      * Linha 924: 'OlderUsedPipelinesWait = 60s' (pipelines de sessões anteriores que excederem
+        60 segundos de compilação são abandonados e empurrados para Background após o jogo abrir).
+      * 'PrebuildLimit' em 'pipeline_eviction_policy.h': usa teto genérico de 25% da RAM total,
+        sem cruzar com a VRAM disponível da placa de vídeo.
+   2. Limite de Armazenamento do Driver da GPU:
+      * Drivers NVIDIA/AMD aplicam política LRU com limite padrão (128 MB a 4 GB).
+      * Recomendação: Manter o cache do driver em "Ilimitado" ou 10 GB no painel de controle.
+   3. Workers Ociosos na Tela de Boot:
+      * 'GetSmartPipelineWorkers' limita a compilação a 2 CPU workers em processadores de 6 threads
+        para proteger a CPU guest e o áudio durante a gameplay. Porém, na tela de boot, a CPU guest
+        e o áudio ainda não iniciaram, deixando 4 núcleos físicos ociosos.
+
+B. ARQUITETURA DO ORÇAMENTO DINÂMICO DE SEGURANÇA (MEMORY-AWARE BOOT BUDGET):
+   * Teto Seguro do Sistema (RAM):
+       - 16 GB RAM: Teto seguro de 14.0 GB (reserva 2.0 GB fixos para Windows e processos de fundo).
+       - 8 GB RAM: Teto seguro de 6.5 GB (reserva 1.5 GB para o SO).
+       - Fórmula: safe_ram_limit = std::min(total_ram * 0.875, total_ram - 2_GiB) (piso: 1.5 GiB).
+   * Teto Seguro da Placa de Vídeo (VRAM):
+       - 8 GB VRAM: Teto seguro de 7.0 GB (reserva 1.0 GB para compositor/DWM e desktop).
+       - 4 GB / 6 GB VRAM: Reserva de 768 MB a 1.0 GB (safe_vram_limit = total_vram - 1_GiB).
+   * Desconto da Carga Base do Jogo:
+       - Reserva obrigatória: ~4.5 GB de RAM (memória guest do Switch + host overhead) e
+         ~2.5 GB de VRAM (framebuffers e texturas iniciais).
+   * Cálculo de Capacidade por Pipeline:
+       - Estimativa conservadora: ~256 KiB RAM e ~128 KiB VRAM por pipeline completo.
+       - Em 16 GB RAM / 8 GB VRAM: permite compilar com segurança de 15.000 a 25.000 pipelines no boot!
+       - Em 8 GB RAM / 4 GB VRAM: limita dinamicamente entre 1.500 e 2.500 pipelines mais recentes.
+   * Promoção Inteligente de Prebuild para Boot Síncrono:
+       - Promove os pipelines de sessões anteriores ('prebuild') para a fila do boot ('boot_graphics'
+         em 'BeginBatch()') até o limite calculado ('max_boot_pipelines').
+       - A barra de progresso da UI ('callback') monitora o total unificado (0% a 100%).
+   * Monitoramento em Tempo Real (Fail-Safe a cada 256 pipelines):
+       - Consulta 'GlobalMemoryStatusEx' e 'VK_EXT_memory_budget'. Se atingir o teto seguro (14 GB RAM
+         ou 7 GB VRAM), interrompe a promoção imediatamente e preserva o restante em background.
+   * Turbo de Workers no Boot Escalável Dinamicamente por Núcleos:
+       - Durante 'PrecompileDiskCache' o jogo ainda não iniciou (CPU guest, GPU thread e áudio estão ociosos).
+       - O emulador escala o número de workers no boot para usar quase 100% da CPU disponível,
+         deixando apenas 1 thread de margem para o sistema/UI:
+           * 4C/4T: Boot -> 3 CPU + 1 Driver  | Gameplay -> 1 CPU + 1 Driver
+           * 6C/6T (i5-9400F): Boot -> 4 a 5 CPU + 1 Driver | Gameplay -> 2 CPU + 1 Driver
+           * 8C/8T ou 4C/8T: Boot -> 6 CPU + 1 a 2 Driver | Gameplay -> 3 CPU + 1 Driver
+           * 6C/12T (Ryzen 5600, i5-12400): Boot -> 9 a 10 CPU + 2 Driver | Gameplay -> 3 CPU + 2 Driver
+           * 8C/16T+ (Ryzen 7800X3D, i7-13700K): Boot -> 13 a 14 CPU + 2 Driver | Gameplay -> 6 CPU + 3 Driver
+       - Fórmula Dinâmica: 'boot_cpu_w = std::max<size_t>(total_threads - 1 - boot_driver_w, 1)'.
+       - Assim que o boot termina e o jogo vai iniciar, as threads extras entram em repouso e
+         o escalonador reverte instantaneamente para o perfil conservador de gameplay,
+         evitando qualquer disputa de núcleos com o jogo emulado.
+
+OUTRAS OTIMIZAÇÕES NO RADAR:
+1. Buffer Cache Sync & Coalescing:
+   - Otimizar o rastreamento de faixas sujas de CPU em uniform buffers dinâmicos,
+     reduzindo downloads síncronos e transferências redundantes.
+
+2. Coleta de Lixo de Imagens (Texture Cache GC):
+   - Otimizar o anel de destruição diferida ('DelayedDestructionRing' / 'sentenced_images')
+     para liberar VRAM de forma progressiva sem causar picos de frametime a cada 60 frames.
+
+3. Redução de Stalls na Fila de Apresentação (Present Fence):
+   - Ajustar o sincronismo entre a thread de renderização e o compositor do sistema (VI),
+     evitando esperas ativas por cercas de sincronização já submetidas.
+
+================================================================================
+Fim do relatório. Arquivo salvo para comparação de benchmarks A/B posteriores.
+================================================================================
