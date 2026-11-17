@@ -49,11 +49,12 @@ An enhanced, high-performance fork of **[zortos293/Lichii](https://github.com/zo
 - **Dedicated VMA Pool for Render Targets & Storage Images:** Allocates render target and storage images up to 8 MiB in a dedicated VMA pool capped at 512 MiB, preventing severe VRAM fragmentation while allowing heavy scenes to overflow dynamically without hard limits.
 - **4 MiB Buffer Blocks:** Sized with a 2 MiB cut-off for optimal device buffer allocation.
 - **Dynamic VRAM Target (85% DXGI Budget):** Soft target caps device memory usage to 85% of available budget (~6.1 GB on 8 GB cards), reserving ample head-room for Windows DWM and preventing system commit exhaustion.
+- **Discrete GPU Memory Threshold Protection:** Distinguishes integrated GPUs from discrete GPUs so non-texture allocations never inadvertently inflate discrete GPU retention floors up to the physical memory limit.
 - **3-Tier Texture Garbage Collector (Anti-Thrashing):**
   - **< 75% VRAM:** Relaxed retention (90 frames, ~1.5–3s), preserving textures across corners and turns with zero re-decode thrashing.
   - **75%–85% VRAM:** Moderate eviction (60 frames, 32 iterations/frame) for steady pruning of stale assets.
   - **> 85% VRAM (Emergency):** High-throughput eviction (15 frames, 128 iterations/frame) to swiftly reclaim space before driver OOM limits.
-- **ShaderCacheWriter Memory Shield:** Protected with `try/catch` exception handlers to ensure disk cache write failures during memory spikes never cause process `abort()`.
+- **Allocation & ShaderCacheWriter Memory Shield:** Protected with `try/catch` exception handlers in `JoinImages` and `CacheWriter` to ensure low-commit spikes or cache write delays never trigger process aborts.
 
 ---
 

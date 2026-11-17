@@ -166,11 +166,13 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
         }
         const double usage_pct = budget > 0 ? (static_cast<double>(total_used_memory) / static_cast<double>(budget)) : 0.0;
 
-        // Emergency trigger: usage above 85% of budget or out of memory
-        const bool emergency_mode = out_of_memory || usage_pct >= 0.85;
+        // Emergency trigger: usage above 85% of budget, out of memory, or exceeding critical threshold
+        const bool emergency_mode = out_of_memory || usage_pct >= 0.85 ||
+                                    (critical_memory > 0 && total_used_memory >= critical_memory);
         // High priority: usage above 75% or exceeding expected threshold
-        high_priority_mode = emergency_mode || usage_pct >= 0.75 || total_used_memory >= expected_memory;
-        aggressive_mode = allow_aggressive && (emergency_mode || total_used_memory >= critical_memory);
+        high_priority_mode = emergency_mode || usage_pct >= 0.75 ||
+                             (expected_memory > 0 && total_used_memory >= expected_memory);
+        aggressive_mode = allow_aggressive && emergency_mode;
 
         if (emergency_mode) {
             // Emergency: rapid eviction of cold images to avoid driver OOM
@@ -193,7 +195,7 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
             return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
         }();
         ticks_to_destroy =
-            EvictionAge(mode_age, min_age, total_used_memory, retention_limit, out_of_memory);
+            EvictionAge(mode_age, min_age, total_used_memory, retention_limit, emergency_mode);
     };
     const auto CanEvict = [this, &high_priority_mode, &aggressive_mode, &evict_old_costly,
                            &evict_bad_overlaps](ImageId image_id,
@@ -645,7 +647,13 @@ void TextureCache<P>::TickFrame() {
                             std::getenv("EDEN_NX2_TC_EXPECTED_MIB") != nullptr ||
                             std::getenv("EDEN_NX2_TC_CRITICAL_MIB") != nullptr;
                         const u64 heap_budget = runtime.GetDeviceHeapMemoryBudget();
-                        if (heap_budget > budget) {
+                        const bool is_integrated = [&]() {
+                            if constexpr (requires { runtime.IsIntegrated(); }) {
+                                return runtime.IsIntegrated();
+                            }
+                            return false;
+                        }();
+                        if (is_integrated && heap_budget > budget) {
                             u64 image_bytes = 0;
                             for (const auto [image_id, image] : slot_images) {
                                 image_bytes += ImageAllocationBytes(*image);
@@ -656,7 +664,7 @@ void TextureCache<P>::TickFrame() {
                             other_memory =
                                 total_used_memory - (std::min)(total_used_memory, image_bytes);
                         }
-                        if (heap_budget > budget && !overridden) {
+                        if (is_integrated && heap_budget > budget && !overridden) {
                             const u64 heap_critical =
                                 heap_budget - (std::min)(reserved, heap_budget / 2);
                             const u64 gap = critical_memory - expected_memory;
@@ -3470,7 +3478,24 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
-    const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+    ImageId new_image_id{};
+    try {
+        new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+    } catch (const std::bad_alloc&) {
+        static u32 logged{};
+        if (logged++ < 32) {
+            LOG_ERROR(HW_GPU, "std::bad_alloc inserting {}x{}x{} image at {:#x}; skipping it",
+                      new_info.size.width, new_info.size.height, new_info.size.depth, gpu_addr);
+        }
+        return ImageId{};
+    } catch (const std::exception& e) {
+        static u32 logged{};
+        if (logged++ < 32) {
+            LOG_ERROR(HW_GPU, "Exception inserting {}x{}x{} image at {:#x}: {}; skipping it",
+                      new_info.size.width, new_info.size.height, new_info.size.depth, gpu_addr, e.what());
+        }
+        return ImageId{};
+    }
     if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
         if (slot_images[new_image_id].OutOfMemory()) {
             // Left out of the cache: lookups see no image (a null view) and make it again once
