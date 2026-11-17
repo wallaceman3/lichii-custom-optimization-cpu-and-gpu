@@ -34,7 +34,7 @@ An enhanced, high-performance fork of **[zortos293/Lichii](https://github.com/zo
 
 ### 5. Precision Hybrid Frame Pacing (`PresentManager` + Mailbox)
 - **`VK_PRESENT_MODE_MAILBOX_KHR`:** Decouples the emulator from rigid FIFO VSync half-rate drops (no more 60 $\to$ 30 FPS drops on 0.1 ms misses).
-- **Zero-Stall Mailbox & Auto Presentation:** In Mailbox VSync and Auto pacing modes, avoids redundant CPU spin-waits and artificial thread delays, delivering fresh frames immediately to the swapchain for maximum throughput on 6-core CPUs.
+- **Zero-Stall Mailbox & Auto Presentation:** In Mailbox VSync and Auto pacing modes, avoids redundant CPU spin-waits and artificial thread delays, delivering fresh frames immediately to the swapchain for maximum throughput on 6-core CPUs while keeping pacing telemetry accurately logged.
 - **Hybrid `SleepUntil`:** For fixed target modes (30/60 FPS), uses kernel OS sleep with a trimmed 250 µs spin-wait to save CPU cycles.
 - **Anti-Burst Protection:** Resets pacing cadence after loading screens or long hitches to prevent fast-forward frame bursts.
 

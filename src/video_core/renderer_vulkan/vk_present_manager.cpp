@@ -347,10 +347,10 @@ void PresentManager::Present(Frame* frame) {
             VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PresentWait};
             scheduler.WaitWorker();
         }
+        const auto ready = std::chrono::steady_clock::now();
         const bool is_mailbox = Settings::values.vsync_mode.GetValue() == Settings::VSyncMode::Mailbox;
         const bool is_auto = Settings::values.frame_pacing_mode.GetValue() == Settings::FramePacingMode::Target_Auto;
         if (!is_mailbox && !is_auto) {
-            const auto ready = std::chrono::steady_clock::now();
             const auto spacing = GetPacingInterval(frame);
             auto start = (std::max)(next_present, ready);
             if (spacing.count() > 0) {
@@ -528,10 +528,10 @@ void PresentManager::PresentThread(std::stop_token token) {
             // before the queue lock goes out of scope. This way the swapchain
             // lock in WaitPresent is guaranteed to occur after here.
             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
+            const auto ready = std::chrono::steady_clock::now();
             const bool is_mailbox = Settings::values.vsync_mode.GetValue() == Settings::VSyncMode::Mailbox;
             const bool is_auto = Settings::values.frame_pacing_mode.GetValue() == Settings::FramePacingMode::Target_Auto;
             if (!is_mailbox && !is_auto) {
-                const auto ready = std::chrono::steady_clock::now();
                 const auto spacing = GetPacingInterval(frame);
                 auto start = (std::max)(next_present, ready);
                 if (spacing.count() > 0) {
