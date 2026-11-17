@@ -96,6 +96,9 @@ struct SharedCodeCache final {
             conf.emplace(jit_conf);
             conf->shared_code_cache.reset();  // the cache must not own itself
             block_of_code.emplace(GenRunCodeCallbacks(conf->callbacks, lookup_block, lookup_block_arg, *conf), JitStateInfo{jit_state, RsbPtrMask(*conf)}, conf->code_cache_size, GenRCP(*conf));
+            if (!conf->enable_avx2) {
+                block_of_code->DisableHostFeature(HostFeature::AVX2);
+            }
             emitter.emplace(*block_of_code, *conf, nullptr);
             polyfill_options = GenPolyfillOptions(*block_of_code);
             if (jit_conf.fastmem_pointer) {
