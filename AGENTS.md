@@ -15,6 +15,10 @@ Keep comments to a reasonable level. Do not overexplain or add/remove comments f
   - Clearly document all custom CPU and GPU optimizations included in the build.
   - Maintain complete credits to upstream authors (Zortos) and contributors (Tasarren for VRAM and memory optimizations).
   - Keep the recommended settings guide accurate and up-to-date.
+- **SEMPRE comparar o log de telemetria com todas as implementações customizadas:**
+  - Em cada nova versão ou análise de sessão, verificar rigorosamente os dados reais do log (`eden_log.txt`: margins de memória/VRAM, host spill, stutters, tempos de JIT e frame pacing).
+  - Confrontar o comportamento do log com cada uma das otimizações implementadas no fork.
+  - Se qualquer implementação customizada apresentar desempenho inferior ao código upstream, causar regressão de FPS, engasgos ou apresentar qualquer problema na aplicação, isso DEVE ser explicitamente reportado e detalhado para avaliação antes de manter ou descartar o código.
 
 ## Game bug reports
 
