@@ -67,20 +67,6 @@ Open **Emulation > Configure** (or `Ctrl+,`):
 
 ---
 
-## 🛠️ Automated Porting & Re-application Tool
-
-This repository includes a standalone Python tool and an Antigravity Agent Skill to automatically re-apply all optimizations onto any future release or branch:
-
-```bash
-# Verify patches against current or new code
-python tools/apply_custom_optimizations.py --check-only
-
-# Apply full optimization stack to any Lichii directory
-python tools/apply_custom_optimizations.py
-```
-
----
-
 ## 👥 Credits and Acknowledgements
 
 This custom optimization fork builds upon the incredible work of the open-source community:
