@@ -2682,7 +2682,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::RebuildGraphicsPipeline(KeptGra
         }
         return code;
     };
-    const bool is_vip = graphics_key.state.depth_write_enable != 0;
+    const bool is_vip = graphics_key.state.dynamic_state.depth_write_enable != 0;
     const auto priority = is_vip ? VideoCommon::ShaderJobPriority::Vip
                                  : VideoCommon::ShaderJobPriority::Soon;
     auto pipeline = std::make_unique<GraphicsPipeline>(
@@ -3218,7 +3218,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             mapped_pointers[index] = envs[mapped_env++]->MappedStoragePointerKeys();
         }
     }
-    const bool is_vip = key.state.depth_write_enable != 0;
+    const bool is_vip = key.state.dynamic_state.depth_write_enable != 0;
     const auto priority = is_vip ? VideoCommon::ShaderJobPriority::Vip
                                  : VideoCommon::ShaderJobPriority::Soon;
     auto pipeline = std::make_unique<GraphicsPipeline>(
