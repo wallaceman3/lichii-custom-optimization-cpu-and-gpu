@@ -225,7 +225,9 @@ private:
 
     /// Where CreateGraphicsPipeline and CreateComputePipeline build; `cpu_bytes` estimates the
     /// IR a deferred emission holds
-    [[nodiscard]] PipelineBuildQueue BuildQueue(bool build_in_parallel, u64 cpu_bytes = 0);
+    [[nodiscard]] PipelineBuildQueue BuildQueue(
+        bool build_in_parallel, u64 cpu_bytes = 0,
+        VideoCommon::ShaderJobPriority priority = VideoCommon::ShaderJobPriority::Soon);
 
     /// Whether the device can build a cached graphics pipeline of this key: its dynamic state
     /// and provoking vertex must match the device's

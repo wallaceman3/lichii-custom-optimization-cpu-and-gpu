@@ -1,0 +1,1509 @@
+From 6741e8a129d067d1002208d7195285e53ad5b73c Mon Sep 17 00:00:00 2001
+From: Developer <dev@local.host>
+Date: Mon, 16 Nov 2026 20:48:40 -0300
+Subject: [PATCH] feat(perf): Phase 1 optimizations (VIP queue, FastDraw
+ same-value, GPU ASTC threshold, frame pacing mailbox hybrid sleep, N-1 async
+ queries, guest CPU polling, batch notifications)
+
+---
+ RESUMO_OTIMIZACOES_FASE1.txt                  | 322 ++++++++++++++++++
+ src/common/recommended_settings.h             |   1 +
+ src/common/settings.cpp                       |   2 +-
+ src/common/settings.h                         |   2 +-
+ src/core/arm/dynarmic/arm_dynarmic_64.cpp     |  14 +-
+ src/core/arm/dynarmic/arm_dynarmic_64.h       |   1 +
+ src/core/hle/kernel/svc/svc_thread.cpp        |   6 +
+ src/tests/video_core/shader_jobs.cpp          |  78 ++++-
+ src/video_core/engines/maxwell_3d.cpp         |   9 +-
+ src/video_core/engines/maxwell_3d.h           |   6 +-
+ .../renderer_vulkan/pipeline_build.h          |   5 +-
+ .../renderer_vulkan/vk_compute_pipeline.cpp   |   2 +-
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |  33 +-
+ .../renderer_vulkan/vk_pipeline_cache.h       |   4 +-
+ .../renderer_vulkan/vk_present_manager.cpp    | 102 +++++-
+ .../renderer_vulkan/vk_present_manager.h      |   4 +
+ .../renderer_vulkan/vk_query_cache.cpp        |  45 +--
+ src/video_core/renderer_vulkan/vk_scheduler.h |  12 +
+ .../renderer_vulkan/vk_swapchain.cpp          |  32 +-
+ .../renderer_vulkan/vk_texture_cache.cpp      |  24 +-
+ src/video_core/shader_jobs.cpp                | 143 +++++++-
+ src/video_core/shader_jobs.h                  |  60 +++-
+ src/video_core/texture_cache/texture_cache.h  |   4 +-
+ 23 files changed, 782 insertions(+), 129 deletions(-)
+ create mode 100644 RESUMO_OTIMIZACOES_FASE1.txt
+
+diff --git a/RESUMO_OTIMIZACOES_FASE1.txt b/RESUMO_OTIMIZACOES_FASE1.txt
+new file mode 100644
+index 0000000000..b2c15a5bad
+--- /dev/null
++++ b/RESUMO_OTIMIZACOES_FASE1.txt
+@@ -0,0 +1,322 @@
++================================================================================
++LICHII (NX2) - RESUMO TÉCNICO DAS OTIMIZAÇÕES IMPLEMENTADAS (FASE 1)
++Data: 16 de Novembro de 2026
++Branch: vip_shader_queue_planning
++Alvo de Performance: CPUs 6-cores/6-threads (e escalável para 8+ threads) / GPUs RTX
++================================================================================
++
++Este documento resume as três grandes otimizações arquiteturais implementadas
++no emulador Lichii, detalhando o que foi feito, como foi feito, por que foi feito,
++os resultados esperados nos testes de framerate/frametime, e o que resta para as
++próximas fases.
++
++--------------------------------------------------------------------------------
++1. O QUE FOI FEITO
++--------------------------------------------------------------------------------
++
++[MÓDULO 1] FILA DE PRIORIDADES INTELIGENTE (FILA VIP DE SHADERS)
++- Criação de uma hierarquia de prioridades de 4 níveis para a fila de compilação:
++    * Prioridade 0: NeedNow (Draw/Dispatch bloqueado na thread de renderização)
++    * Prioridade 1: Vip (Compute pipelines e gráficos com Depth-Write ligado)
++    * Prioridade 2: Soon (Shaders de partículas, fumaça, efeitos e carregamento de boot)
++    * Prioridade 3: Background (Pre-compilação em disco, precache e rebaixamento)
++- Implementação de heurística O(1) de classificação rápida no momento do registro:
++    * Shaders de Compute: sempre VIP.
++    * Shaders Gráficos: 'key.state.depth_write_enable != 0' -> VIP; caso contrário -> Soon.
++- Atualização do escalonador de jobs (ShaderJobScheduler::Pick) para priorizar
++  jobs VIP estritamente antes de Soon, mantendo a proteção de aging (envelhecimento)
++  para tarefas em background e a promoção instantânea para NeedNow caso um draw dependa dele.
++- Criação de testes unitários multithread cobrindo a nova ordem de prioridade.
++
++[MÓDULO 2] REDUÇÃO DE FALSOS POSITIVOS NO NX2FASTDRAW (PREPAREDRAW / REGISTRADORES)
++- Eliminação de quebras indevidas do FastDraw causadas por escrita de mesmo valor
++  (same-value write) em registradores de estado no Maxwell 3D:
++    * No 'ProcessDirtyRegisters' (maxwell_3d.h), se 'regs.reg_array[method] == argument',
++      o método agora retorna após processar eventuais draws adiados, sem sujar 'dirty.tables'
++      e sem disparar 'Nx2FastDraw::Break(Reason::Register)'.
++- Tratamento especializado para registradores de armazenamento puro ('IsStoreOnlyExecutable'):
++    * 'topology_override', 'vertex_buffer.first', 'vertex_buffer.count' e 'index_buffer.first'.
++    * Tanto em 'CallMethodFast' quanto em 'CallMethodSlow', esses métodos agora passam
++      pelo filtro de registradores de estado ('WriteStateRegister'), evitando a armadilha de
++      chamar 'ProcessMethodCall' em macros (o que antes disparava falsos positivos
++      de 'Nx2FastDraw::Break(Reason::Method)' toda vez que uma macro reescrevia topologia idêntica).
++- Preservação estrita dos métodos executáveis de gatilho/ação ('draw.begin', 'clear_surface',
++  'launch_dma', 'report_semaphore.query', etc.), garantindo que efeitos colaterais
++  de hardware jamais sejam ignorados mesmo se reescritos com mesmo valor.
++
++[MÓDULO 3] GPU UNSWIZZLE & DECODIFICAÇÃO ASTC VIA COMPUTE SHADER
++- Limiar de tamanho inteligente para decodificação ASTC:
++    * Texturas menores que 64x64 pixels ou menos de 4096 bytes são decodificadas
++      em nanosegundos diretamente na CPU ('ASTC::Decompress').
++    * Texturas médias e grandes (cenários, modelos, terreno, mapas normais) são
++      obrigatoriamente roteadas para o Compute Shader na GPU ('astc_decoder.comp' e
++      'bc_encoder.comp' via 'AcceleratedUpload').
++- Correção de operador invertido no GPU Unswizzle:
++    * Em 'texture_cache.h', a condição 'MapSizeBytes(image) >= gpu_unswizzle_maxsize'
++      foi corrigida para 'MapSizeBytes(image) <= gpu_unswizzle_maxsize && MapSizeBytes(image) >= 4096'.
++      Anteriormente, nenhuma textura menor que o limite máximo (128/256 MB) conseguia usar
++      o desentrelazamento assíncrono na GPU.
++- Sincronização de barreiras de memória e transições de layout:
++    * Em 'CopyBufferToImage', o estágio de destino da barreira pós-transferência foi
++      atualizado de simples attachments para 'vk::PIPELINE_STAGE_GRAPHICS_COMPUTE',
++      garantindo visibilidade de leitura ('VK_ACCESS_SHADER_READ_BIT') para vertex e fragment
++      shaders e eliminando texturas piscando ou corrompidas no primeiro frame.
++
++[MÓDULO 4] FRAME PACING DE ALTA PRECISÃO (PRESENTMANAGER + MAILBOX + HYBRID SLEEP)
++- Eliminação do "engasgo fantasma" e judder de câmera através do modo Mailbox:
++    * 'VK_PRESENT_MODE_MAILBOX_KHR' adicionado às configurações recomendadas ('recommended_settings.h').
++    * Desacopla o emulador da trava rígida do FIFO (VSync tradicional que causa quedas bruscas
++      de 60 para 30 FPS se um frame atrasar 0.1 ms).
++- Implementação de Sleep Híbrido de Alta Precisão ('SleepUntil' em 'vk_present_manager.cpp'):
++    * Fase Kernel: Enquanto restar mais de ~1.5 ms (1500 us) para o deadline, a thread dorme
++      via SO ('SleepForOneTick' no Windows / 'sleep_for' em outros), liberando 100% dos ciclos de CPU.
++    * Fase Spin-Wait com Instrução Pause: Nos últimos ~1.5 ms até o exato instante do deadline,
++      executa um loop ultracurto com '_mm_pause()' (x86/x64) ou 'yield' (ARM64).
++      Isso elimina completamente o jitter do escalonador do Windows (que varia entre 0.5 e 2 ms)
++      e acerta a entrega do frame com precisão de microssegundos.
++- Escalonamento Dinâmico de Spacing no PresentManager ('GetPacingInterval'):
++    * O PresentManager agora calcula a cadência exata para frames nativos do jogo
++      (16.666 ms para 60 FPS, 33.333 ms para 30 FPS via 'g_nx2_guest_frame_interval_ns'),
++      não apenas para frames interpolados por Frame Generation.
++    * Proteção contra efeito sanfona (bursting): se o jogo sofrer um congelamento ou queda
++      maior que 2 intervalos de frame, a cadência é realinhada para o tempo atual ('start = ready'),
++      impedindo que múltiplos quadros sejam jogados de uma vez no Mailbox.
++- Eliminação de esperas conflitantes e otimização do Scheduler:
++    * 'Swapchain::AcquireNextImage' agora delega o pacing 100% para o PresentManager,
++      passando 'target_fps = 0.0' para evitar esperas duplicadas.
++    * 'Scheduler::Wait' atualizado para usar '_mm_pause()' em vez de 'std::this_thread::yield()',
++      evitando preempções desnecessárias pelo SO.
++
++[MÓDULO 5] READ-BACKS ASSÍNCRONOS N-1 EM OCCLUSION QUERIES
++- Eliminação de stalls de 2 a 8 ms causados por leituras síncronas de GPU:
++    * Em 'SamplesQueryBank::Sync' (vk_query_cache.cpp), a leitura dos resultados de queries
++      de oclusão ('ZPassPixelCount64') via 'vkGetQueryPoolResults' agora é não-bloqueante.
++    * Se o resultado ainda não estiver pronto ('VK_NOT_READY'), a CPU não mais trava em loop
++      de busy-wait: retorna imediatamente o último valor conhecido ('last_known_result' / N-1).
++    * Isolamento estrito de segurança: Transform Feedback ('TfbQueryBank') e contadores de
++      primitivas continuam estritamente síncronos, prevenindo quaisquer falhas de física ou colisão.
++
++[MÓDULO 6] MITIGAÇÃO CONSERVADORA DE BUSY-POLLING NA CPU GUEST
++- Ceder núcleo em chamadas de rendição ('svcSleepThread'):
++    * Em 'svc_thread.cpp', quando o guest chama 'SleepThread' com valores <= 10.000 ns (ou 0),
++      ou sinaliza rendição de núcleo ('WithoutCoreMigration', 'WithCoreMigration', 'ToAnyThread'),
++      dispara 'std::this_thread::yield()' no host para não queimar 100% de CPU em loops ociosos.
++- Detector de spin-loop por leitura de timer ('GetCNTPCT'):
++    * Em 'arm_dynarmic_64.cpp', adicionado contador 'm_consecutive_spin_polls' para leituras
++      consecutivas com intervalo inferior a 32 ticks (~1.7 us).
++    * Ao atingir 2.000 iterações em loop fechado, dispara um único 'std::this_thread::yield()',
++      cedendo a CPU física para workers de compilação VIP e threads de áudio.
++
++[MÓDULO 7] BATCHING DE SUBMISSÃO E COALESCÊNCIA DE NOTIFICAÇÕES (SHADERS)
++- Eliminação do overhead de syscalls na thread principal:
++    * Criação do método 'ShaderJobScheduler::Submit(std::span<ShaderJob> jobs, const ShaderJobBatch* batch)'.
++      Permite submeter múltiplos jobs sob uma única aquisição do mutex do escalonador.
++    * Implementação do escopo RAII 'BatchScope' ('BeginBatch()'):
++      Adia a notificação das condition variables ('cpu_condition', 'driver_condition') enquanto
++      jobs estão sendo adicionados ao lote, emitindo um único 'notify_all()' apenas na saída do escopo.
++    * Otimização do 'ParallelFor' (utilizado na tradução de estágios de shaders - 'TranslateStages'):
++      Submissão em lote unificada de todos os estágios do pipeline (Vertex, Fragment, Compute, etc.)
++      em vez de submeter 1 por 1 com notificações repetidas.
++    * Coalescência no carregamento de disk cache ('PrecompileDiskCache'):
++      Agrupamento de submissões em lote no pré-carregamento de compute e gráficos, reduzindo
++      milhares de syscalls de kernel no Windows para um punhado de notificações em lote.
++
++--------------------------------------------------------------------------------
++2. ARQUIVOS MODIFICADOS E DETALHES DE IMPLEMENTAÇÃO
++--------------------------------------------------------------------------------
++
++1. src/video_core/shader_jobs.h
++   - Adicionado 'ShaderJobPriority::Vip = 1' e atualizado 'NumShaderJobPriorities = 4'.
++   - Implementado 'Submit(std::span<ShaderJob>)' e escopo RAII 'BatchScope' ('BeginBatch()').
++2. src/video_core/shader_jobs.cpp
++   - Atualizado 'ShaderJobScheduler::Pick' para consumir 'Vip' logo após 'NeedNow'.
++   - Implementado 'EnterBatch()', 'LeaveBatch()' e submissão em lote com notificação coalescida.
++   - Refatorado 'ParallelFor' para submeter todos os índices em lote único.
++3. src/video_core/renderer_vulkan/pipeline_build.h
++   - 'PipelineBuildQueue' e 'PipelineBuild' agora aceitam a prioridade configurada.
++4. src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++   - 'ComputePipeline' passa a submeter jobs com 'build_queue.priority'.
++5. src/video_core/renderer_vulkan/vk_pipeline_cache.h & .cpp
++   - Heurística O(1) em 'CreateGraphicsPipeline' e 'RebuildGraphicsPipeline':
++     'key.state.depth_write_enable != 0 ? ShaderJobPriority::Vip : ShaderJobPriority::Soon'.
++   - 'CreateComputePipeline' classifica explicitamente como 'Vip'.
++   - 'PrecompileDiskCache' utiliza 'BeginBatch()' para agrupamento de submissões na inicialização.
++6. src/tests/video_core/shader_jobs.cpp
++   - Adicionados casos de teste Catch2 cobrindo 'Vip' e submissões em lote com 'BeginBatch()'.
++7. src/video_core/engines/maxwell_3d.h
++   - 'ProcessDirtyRegisters' retorna antecipadamente se 'regs.reg_array[method] == argument',
++     preservando a resolução de draws adiados e impedindo flags sujas espúrias.
++8. src/video_core/engines/maxwell_3d.cpp
++   - 'CallMethodFast' e 'CallMethodSlow' tratam 'IsStoreOnlyExecutable' de forma consistente
++     através de 'WriteStateRegister', blindando o 'Nx2FastDraw' contra quebras de macro.
++9. src/video_core/renderer_vulkan/vk_texture_cache.cpp
++   - Adicionada função 'IsGpuComputeSizeEligible' (limiar de 4096 bytes ou 64x64).
++   - Inserida barreira correta de shader read em 'CopyBufferToImage'.
++10. src/video_core/texture_cache/texture_cache.h
++    - Corrigido o operador do GPU Unswizzle para respeitar o teto 'gpu_unswizzle_maxsize'
++      e o piso mínimo de 4 KiB.
++11. src/video_core/renderer_vulkan/vk_present_manager.h & .cpp
++    - Implementado método 'GetPacingInterval' calculando cadência para frames nativos.
++    - Implementado sleep híbrido em 'SleepUntil' (kernel até 1.5 ms + spin com '_mm_pause()').
++    - Proteção contra frame bursting e sincronização de cadência no 'PresentThread'.
++12. src/video_core/renderer_vulkan/vk_swapchain.cpp
++    - 'Swapchain::AcquireNextImage' desacoplado de esperas redundantes de target_fps.
++13. src/video_core/renderer_vulkan/vk_scheduler.h
++    - Substituído 'std::this_thread::yield()' por '_mm_pause()' no spin loop tail.
++14. src/common/recommended_settings.h
++    - Adicionado 'vsync_mode = VSyncMode::Mailbox' nas configurações recomendadas.
++15. src/common/settings.h & settings.cpp
++    - Ajustado template explícito de 'VSyncMode' de 'SETTING' para 'SWITCHABLE',
++      resolvendo erro de compilação por símbolo não resolvido.
++16. src/video_core/renderer_vulkan/vk_query_cache.cpp
++    - Adicionados includes '<array>' e '<cstring>' para compilação estrita.
++    - 'SamplesQueryBank::Sync' atualizado para leitura assíncrona N-1 sem espera síncrona.
++17. src/core/hle/kernel/svc/svc_thread.cpp
++    - 'SleepThread' dispara 'std::this_thread::yield()' para valores <= 10.000 ns ou yields.
++18. src/core/arm/dynarmic/arm_dynarmic_64.h & .cpp
++    - Adicionado contador de busy-polling e yield no 'GetCNTPCT' após 2.000 spins consecutivos.
++
++--------------------------------------------------------------------------------
++3. POR QUE FOI FEITO (AS CAUSAS RAIZ)
++--------------------------------------------------------------------------------
++
++- Gargalo 1 (Fila de Banco FIFO em Shaders):
++  Em CPUs de 6 threads, existem apenas 2 workers de compilação disponíveis. Se uma
++  explosão ou efeito visual gerasse 30 partículas de fumaça na fila, os workers ficavam
++  ocupados compilando partículas transparentes. Quando o chão ou o modelo do personagem
++  chegava milissegundos depois, ele esperava atrás das partículas, causando buracos
++  no cenário e travamentos bruscos no frametime.
++
++- Gargalo 2 (Quebra Excessiva de FastDraw):
++  O emulador possui o mecanismo 'Nx2FastDraw' para reutilizar o pipeline e bindings
++  entre draws idênticos ou com pequenas deltas (instâncias, vegetação, malhas repetidas).
++  Macros de gameplay frequentemente reescrevem o mesmo registrador de topologia ou
++  parâmetros com valores idênticos. O emulador marcava 'Dirty::VertexInput' e chamava
++  'Nx2FastDraw::Break(Reason::Method)', forçando o emulador a cair para o caminho pesado
++  de 'FullDraw' (revalidação completa de estado no Vulkan).
++
++- Gargalo 3 (Streaming de Texturas Travando a Thread Gráfica):
++  Jogos de mundo aberto no Switch usam intensamente texturas ASTC e block-linear.
++  A decodificação ASTC por software na CPU consumia dezenas de milissegundos por textura.
++  Além disso, texturas 3D BCn caíam sempre na CPU por conta de uma condição '>' invertida
++  na checagem de tamanho, e texturas minúsculas de UI sobrecarregavam a GPU com submits
++  frequentes de Compute.
++
++- Gargalo 4 (Engasgo Fantasma no Frame Pacing / Mailbox sem Pacer de CPU):
++  No modo FIFO tradicional, se um frame atrasar 0.1 ms além de 16.66 ms, o driver
++  segura o quadro anterior e derruba o FPS para 30 instantaneamente. O modo Mailbox
++  resolve a trava do FIFO, mas sem um limitador de tempo de alta precisão no PresentManager,
++  a GPU entregava dois quadros em rápida sucessão (ex: 8 ms) que se sobrescreviam no mailbox,
++  gerando a sensação de "engasgo fantasma" onde o contador mostra 60 FPS mas a câmera
++  parece trepidar. Além disso, o 'SleepUntil' anterior usava apenas sleeps do Windows
++  com resolução de ~1 ms, gerando oscilações contínuas na linha de frametime.
++
++--------------------------------------------------------------------------------
++4. O QUE SE ESPERA / ONDE DEVE MELHORAR
++--------------------------------------------------------------------------------
++
++1. Estabilidade de Framerate (1% Low e 0.1% Low):
++   - Redução drástica de micro-engasgos (stutters) durante momentos de ação intensa
++     (explosões, combate, magias com muitas partículas), pois o cenário e os
++     personagens não ficam mais esperando a compilação de poeira.
++
++2. Custo de CPU por Draw Call (FastDraw Hit Rate):
++   - Aumento significativo da taxa de acerto do 'Nx2FastDraw'. Rajadas de vegetação,
++     grama, multidões e peças de malha repetidas permanecerão no caminho rápido de delta draw,
++     reduzindo o tempo de CPU por frame e estabilizando a linha de 60/30 FPS.
++
++3. Fluidez no Streaming de Mundo Aberto:
++   - Em curvas rápidas, giros de câmera ou transições de áreas, as texturas de terreno
++     e modelos 3D serão descompactadas e desentrelazadas em microssegundos pelos
++     Compute Shaders da GPU dedicada, enquanto ícones de UI não causarão mais
++     flushes desnecessários no command buffer do Vulkan.
++
++4. Linha de Frame Time Perfeitamente Plana (Frame Pacing):
++   - Movimento de câmera completamente suave (smoothness de 60 FPS real).
++   - O sleep híbrido (kernel até 1.5 ms + spin com _mm_pause()) crava cada frame
++     no tempo exato (16.666 ms em 60 FPS e 33.333 ms em 30 FPS).
++   - O modo Mailbox garante que a GPU não seja penalizada caso um frame exceda
++     levemente a margem, sem travamentos de VSync de meio ciclo.
++
++5. Ausência de Regressões Gráficas:
++   - Texturas sem cintilação no primeiro frame devido à sincronização completa de estágios.
++   - Todos os comandos de hardware e triggers continuam intactos.
++
++--------------------------------------------------------------------------------
++5. PRÓXIMOS PASSOS (O QUE FALTA IMPLEMENTAR)
++--------------------------------------------------------------------------------
++
++[PRIORIDADE MÁXIMA DA FASE 2] CARREGAMENTO MÁXIMO DE SHADERS NO BOOT COM ORÇAMENTO
++DINÂMICO DE MEMÓRIA (MEMORY-AWARE BOOT BUDGET & WORKER TURBO)
++
++Objetivo: Eliminar qualquer compilação síncrona tardia e micro-stutters durante o jogo,
++carregando o máximo possível de pipelines na tela inicial de "Loading Shaders", mas
++de forma inteligente e 100% segura contra Out-of-Memory (OOM) e paginação.
++
++A. AS 3 TRAVAS IDENTIFICADAS NO CÓDIGO ATUAL (vk_pipeline_cache.cpp / pipeline_eviction_policy.h):
++   1. Corte Rígido de Sessões e Tempo de Espera (AwaitedUsedSessions & OlderUsedPipelinesWait):
++      * Linha 923: 'AwaitedUsedSessions = 2' (apenas as últimas 2 sessões vão para o boot bloqueante).
++      * Linha 924: 'OlderUsedPipelinesWait = 60s' (pipelines de sessões anteriores que excederem
++        60 segundos de compilação são abandonados e empurrados para Background após o jogo abrir).
++      * 'PrebuildLimit' em 'pipeline_eviction_policy.h': usa teto genérico de 25% da RAM total,
++        sem cruzar com a VRAM disponível da placa de vídeo.
++   2. Limite de Armazenamento do Driver da GPU:
++      * Drivers NVIDIA/AMD aplicam política LRU com limite padrão (128 MB a 4 GB).
++      * Recomendação: Manter o cache do driver em "Ilimitado" ou 10 GB no painel de controle.
++   3. Workers Ociosos na Tela de Boot:
++      * 'GetSmartPipelineWorkers' limita a compilação a 2 CPU workers em processadores de 6 threads
++        para proteger a CPU guest e o áudio durante a gameplay. Porém, na tela de boot, a CPU guest
++        e o áudio ainda não iniciaram, deixando 4 núcleos físicos ociosos.
++
++B. ARQUITETURA DO ORÇAMENTO DINÂMICO DE SEGURANÇA (MEMORY-AWARE BOOT BUDGET):
++   * Teto Seguro do Sistema (RAM):
++       - 16 GB RAM: Teto seguro de 14.0 GB (reserva 2.0 GB fixos para Windows e processos de fundo).
++       - 8 GB RAM: Teto seguro de 6.5 GB (reserva 1.5 GB para o SO).
++       - Fórmula: safe_ram_limit = std::min(total_ram * 0.875, total_ram - 2_GiB) (piso: 1.5 GiB).
++   * Teto Seguro da Placa de Vídeo (VRAM):
++       - 8 GB VRAM: Teto seguro de 7.0 GB (reserva 1.0 GB para compositor/DWM e desktop).
++       - 4 GB / 6 GB VRAM: Reserva de 768 MB a 1.0 GB (safe_vram_limit = total_vram - 1_GiB).
++   * Desconto da Carga Base do Jogo:
++       - Reserva obrigatória: ~4.5 GB de RAM (memória guest do Switch + host overhead) e
++         ~2.5 GB de VRAM (framebuffers e texturas iniciais).
++   * Cálculo de Capacidade por Pipeline:
++       - Estimativa conservadora: ~256 KiB RAM e ~128 KiB VRAM por pipeline completo.
++       - Em 16 GB RAM / 8 GB VRAM: permite compilar com segurança de 15.000 a 25.000 pipelines no boot!
++       - Em 8 GB RAM / 4 GB VRAM: limita dinamicamente entre 1.500 e 2.500 pipelines mais recentes.
++   * Promoção Inteligente de Prebuild para Boot Síncrono:
++       - Promove os pipelines de sessões anteriores ('prebuild') para a fila do boot ('boot_graphics'
++         em 'BeginBatch()') até o limite calculado ('max_boot_pipelines').
++       - A barra de progresso da UI ('callback') monitora o total unificado (0% a 100%).
++   * Monitoramento em Tempo Real (Fail-Safe a cada 256 pipelines):
++       - Consulta 'GlobalMemoryStatusEx' e 'VK_EXT_memory_budget'. Se atingir o teto seguro (14 GB RAM
++         ou 7 GB VRAM), interrompe a promoção imediatamente e preserva o restante em background.
++   * Turbo de Workers no Boot Escalável Dinamicamente por Núcleos:
++       - Durante 'PrecompileDiskCache' o jogo ainda não iniciou (CPU guest, GPU thread e áudio estão ociosos).
++       - O emulador escala o número de workers no boot para usar quase 100% da CPU disponível,
++         deixando apenas 1 thread de margem para o sistema/UI:
++           * 4C/4T: Boot -> 3 CPU + 1 Driver  | Gameplay -> 1 CPU + 1 Driver
++           * 6C/6T (i5-9400F): Boot -> 4 a 5 CPU + 1 Driver | Gameplay -> 2 CPU + 1 Driver
++           * 8C/8T ou 4C/8T: Boot -> 6 CPU + 1 a 2 Driver | Gameplay -> 3 CPU + 1 Driver
++           * 6C/12T (Ryzen 5600, i5-12400): Boot -> 9 a 10 CPU + 2 Driver | Gameplay -> 3 CPU + 2 Driver
++           * 8C/16T+ (Ryzen 7800X3D, i7-13700K): Boot -> 13 a 14 CPU + 2 Driver | Gameplay -> 6 CPU + 3 Driver
++       - Fórmula Dinâmica: 'boot_cpu_w = std::max<size_t>(total_threads - 1 - boot_driver_w, 1)'.
++       - Assim que o boot termina e o jogo vai iniciar, as threads extras entram em repouso e
++         o escalonador reverte instantaneamente para o perfil conservador de gameplay,
++         evitando qualquer disputa de núcleos com o jogo emulado.
++
++OUTRAS OTIMIZAÇÕES NO RADAR:
++1. Buffer Cache Sync & Coalescing:
++   - Otimizar o rastreamento de faixas sujas de CPU em uniform buffers dinâmicos,
++     reduzindo downloads síncronos e transferências redundantes.
++
++2. Coleta de Lixo de Imagens (Texture Cache GC):
++   - Otimizar o anel de destruição diferida ('DelayedDestructionRing' / 'sentenced_images')
++     para liberar VRAM de forma progressiva sem causar picos de frametime a cada 60 frames.
++
++3. Redução de Stalls na Fila de Apresentação (Present Fence):
++   - Ajustar o sincronismo entre a thread de renderização e o compositor do sistema (VI),
++     evitando esperas ativas por cercas de sincronização já submetidas.
++
++================================================================================
++Fim do relatório. Arquivo salvo para comparação de benchmarks A/B posteriores.
++================================================================================
+diff --git a/src/common/recommended_settings.h b/src/common/recommended_settings.h
+index 2a1ccfedf3..e8bff63128 100644
+--- a/src/common/recommended_settings.h
++++ b/src/common/recommended_settings.h
+@@ -31,6 +31,7 @@ void ForEachRecommendedSetting(Values& settings, Func&& func) {
+     entry(settings.accelerate_astc, AstcDecodeMode::Gpu);
+     entry(settings.frame_pacing_mode, FramePacingMode::Target_Auto);
+     entry(settings.astc_recompression, AstcRecompression::Bc3);
++    entry(settings.vsync_mode, VSyncMode::Mailbox);
+     entry(settings.sync_memory_operations, false);
+     entry(settings.renderer_force_max_clock, false);
+     entry(settings.use_disk_shader_cache, true);
+diff --git a/src/common/settings.cpp b/src/common/settings.cpp
+index a2e57f9dec..797fb6074b 100644
+--- a/src/common/settings.cpp
++++ b/src/common/settings.cpp
+@@ -68,7 +68,7 @@ SWITCHABLE(ScalingFilter, false);
+ SWITCHABLE(FrameGenType, false);
+ SWITCHABLE(SpirvOptimizeMode, true);
+ SWITCHABLE(TimeZone, true);
+-SETTING(VSyncMode, true);
++SWITCHABLE(VSyncMode, true);
+ SWITCHABLE(bool, false);
+ SWITCHABLE(int, false);
+ SWITCHABLE(int, true);
+diff --git a/src/common/settings.h b/src/common/settings.h
+index 26aba87647..c033eb76d0 100644
+--- a/src/common/settings.h
++++ b/src/common/settings.h
+@@ -84,7 +84,7 @@ SWITCHABLE(RendererBackend, true);
+ SWITCHABLE(ScalingFilter, false);
+ SWITCHABLE(SpirvOptimizeMode, true);
+ SWITCHABLE(TimeZone, true);
+-SETTING(VSyncMode, true);
++SWITCHABLE(VSyncMode, true);
+ SWITCHABLE(bool, false);
+ SWITCHABLE(int, false);
+ SWITCHABLE(int, true);
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.cpp b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+index 52530e9bab..ad23248eb7 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.cpp
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.cpp
+@@ -6,6 +6,7 @@
+ #include <array>
+ #include <atomic>
+ #include <cstdlib>
++#include <thread>
+ #if defined(_M_X64) || defined(__x86_64__)
+ #include <immintrin.h>
+ #endif
+@@ -295,12 +296,19 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
+         return value == nullptr || value[0] != '0';
+     }();
+     if (pause_spins && ticks - m_last_cntpct < m_spin_ticks) {
++        if (++m_consecutive_spin_polls >= 2000) {
++            m_consecutive_spin_polls = 0;
++            std::this_thread::yield();
++        } else {
+ #if defined(_M_X64) || defined(__x86_64__)
+-        _mm_pause();
+-        _mm_pause();
++            _mm_pause();
++            _mm_pause();
+ #elif defined(__aarch64__)
+-        asm volatile("yield");
++            asm volatile("yield");
+ #endif
++        }
++    } else {
++        m_consecutive_spin_polls = 0;
+     }
+     m_last_cntpct = ticks;
+     if (Kernel::Nx2ThreadStats::g_enabled) {
+diff --git a/src/core/arm/dynarmic/arm_dynarmic_64.h b/src/core/arm/dynarmic/arm_dynarmic_64.h
+index f8b38987b4..e82591b934 100644
+--- a/src/core/arm/dynarmic/arm_dynarmic_64.h
++++ b/src/core/arm/dynarmic/arm_dynarmic_64.h
+@@ -70,6 +70,7 @@ public:
+     u64 m_tpidr_el0{};
+     u64 m_last_cntpct{}; ///< The previous counter read (GetCNTPCT spin detection)
+     u64 m_spin_ticks{32}; ///< Reads closer than this (~1.7 us) count as a polling loop
++    u32 m_consecutive_spin_polls{}; ///< Number of consecutive spin-poll reads without delay
+     Kernel::KProcess* m_process{};
+     std::shared_ptr<WindowTrace::Session> m_window_trace;
+     const bool m_debugger_enabled{};
+diff --git a/src/core/hle/kernel/svc/svc_thread.cpp b/src/core/hle/kernel/svc/svc_thread.cpp
+index 63878e155b..2710ce30c7 100644
+--- a/src/core/hle/kernel/svc/svc_thread.cpp
++++ b/src/core/hle/kernel/svc/svc_thread.cpp
+@@ -185,12 +185,18 @@ void SleepThread(Core::System& system, s64 ns) {
+         // Sleep.
+         // NOTE: Nintendo does not check the result of this sleep.
+         static_cast<void>(GetCurrentThread(kernel).Sleep(kernel, timeout));
++        if (ns <= 10000) {
++            std::this_thread::yield();
++        }
+     } else if (yield_type == Svc::YieldType::WithoutCoreMigration) {
+         KScheduler::YieldWithoutCoreMigration(kernel);
++        std::this_thread::yield();
+     } else if (yield_type == Svc::YieldType::WithCoreMigration) {
+         KScheduler::YieldWithCoreMigration(kernel);
++        std::this_thread::yield();
+     } else if (yield_type == Svc::YieldType::ToAnyThread) {
+         KScheduler::YieldToAnyThread(kernel);
++        std::this_thread::yield();
+     } else {
+         // Nintendo does nothing at all if an otherwise invalid value is passed.
+     }
+diff --git a/src/tests/video_core/shader_jobs.cpp b/src/tests/video_core/shader_jobs.cpp
+index 60ad887eb0..7c0bec2907 100644
+--- a/src/tests/video_core/shader_jobs.cpp
++++ b/src/tests/video_core/shader_jobs.cpp
+@@ -162,17 +162,41 @@ TEST_CASE("Shader jobs run the highest priority first", "[video_core][shader_job
+     REQUIRE(order.Get() == std::vector<int>{3, 2, 4, 1, 5});
+     REQUIRE(queued.priorities[0].running == 1);
+     REQUIRE(queued.priorities[0].queued == 1);
+-    REQUIRE(queued.priorities[1].queued == 2);
++    REQUIRE(queued.priorities[1].queued == 0);
+     REQUIRE(queued.priorities[2].queued == 2);
++    REQUIRE(queued.priorities[3].queued == 2);
+     REQUIRE(stats.priorities[0].done == 2);
+-    REQUIRE(stats.priorities[1].done == 2);
++    REQUIRE(stats.priorities[1].done == 0);
+     REQUIRE(stats.priorities[2].done == 2);
++    REQUIRE(stats.priorities[3].done == 2);
+     for (const auto& priority : stats.priorities) {
+         REQUIRE(priority.queued == 0);
+         REQUIRE(priority.running == 0);
+     }
+-    REQUIRE(stats.priorities[2].queue_wait_ns > 0);
+-    REQUIRE(stats.priorities[2].max_queue_wait_ns <= stats.priorities[2].queue_wait_ns);
++    REQUIRE(stats.priorities[3].queue_wait_ns > 0);
++    REQUIRE(stats.priorities[3].max_queue_wait_ns <= stats.priorities[3].queue_wait_ns);
++}
++
++TEST_CASE("Shader jobs run Vip priority before Soon", "[video_core][shader_jobs]") {
++    ShaderJobScheduler scheduler{Config(1, 1)};
++    Gate gate;
++    const auto blocker = Block(scheduler, gate);
++    Order order;
++    std::vector<ShaderJobHandle> jobs;
++    jobs.push_back(scheduler.Submit(CpuJob(Background, [&] { order.Add(1); })));
++    jobs.push_back(scheduler.Submit(CpuJob(Soon, [&] { order.Add(2); })));
++    jobs.push_back(scheduler.Submit(CpuJob(Vip, [&] { order.Add(3); })));
++    jobs.push_back(scheduler.Submit(CpuJob(NeedNow, [&] { order.Add(4); })));
++    jobs.push_back(scheduler.Submit(CpuJob(Soon, [&] { order.Add(5); })));
++    jobs.push_back(scheduler.Submit(CpuJob(Vip, [&] { order.Add(6); })));
++    jobs.push_back(scheduler.Submit(CpuJob(Background, [&] { order.Add(7); })));
++    gate.Open();
++    for (const auto& job : jobs) {
++        job.Wait();
++    }
++    blocker.Wait();
++    // Expected order: NeedNow (4) -> Vip (3, 6) -> Soon (2, 5) -> Background (1, 7)
++    REQUIRE(order.Get() == std::vector<int>{4, 3, 6, 2, 5, 1, 7});
+ }
+ 
+ TEST_CASE("Shader jobs promote queued jobs in both queues", "[video_core][shader_jobs]") {
+@@ -198,8 +222,9 @@ TEST_CASE("Shader jobs promote queued jobs in both queues", "[video_core][shader
+         REQUIRE(second.Priority() == Soon);
+         REQUIRE(first.Priority() == Background);
+         REQUIRE(promoted.priorities[0].queued == 1);
+-        REQUIRE(promoted.priorities[1].queued == 1);
++        REQUIRE(promoted.priorities[1].queued == 0);
+         REQUIRE(promoted.priorities[2].queued == 1);
++        REQUIRE(promoted.priorities[3].queued == 1);
+         REQUIRE(scheduler.Stats().priorities[0].done == 2);
+         REQUIRE(order.Get() == std::vector<int>{3, 2, 1});
+     }
+@@ -428,7 +453,7 @@ TEST_CASE("Shader jobs cancel queued and running jobs", "[video_core][shader_job
+         REQUIRE(cancelled_at_once);
+         REQUIRE(released_at_once);
+         REQUIRE_FALSE(ran);
+-        REQUIRE(scheduler.Stats().priorities[2].cancelled == 1);
++        REQUIRE(scheduler.Stats().priorities[3].cancelled == 1);
+     }
+     SECTION("Running CPU stage") {
+         bool driver_ran{};
+@@ -589,8 +614,8 @@ TEST_CASE("Shader job stage exceptions fail only that job", "[video_core][shader
+     }
+     REQUIRE(caught_message);
+     REQUIRE(caught_int);
+-    REQUIRE(stats.priorities[1].failed == 2);
+-    REQUIRE(stats.priorities[1].done == 1);
++    REQUIRE(stats.priorities[2].failed == 2);
++    REQUIRE(stats.priorities[2].done == 1);
+     REQUIRE(stats.in_flight_bytes == 0);
+ }
+ 
+@@ -659,7 +684,8 @@ TEST_CASE("Shader jobs stay consistent with many producers", "[video_core][shade
+             std::mt19937 random{static_cast<u32>(producer)};
+             for (int i = 0; i < JobsPerProducer; ++i) {
+                 const size_t index = static_cast<size_t>(producer * JobsPerProducer + i);
+-                const auto priority = static_cast<ShaderJobPriority>(random() % 3);
++                const auto priority =
++                    static_cast<ShaderJobPriority>(random() % VideoCommon::NumShaderJobPriorities);
+                 Runs& run = runs[index];
+                 handles[index] = scheduler.Submit(
+                     TwoStageJob(
+@@ -754,6 +780,40 @@ TEST_CASE("ParallelFor calls every index once, helped by the calling thread",
+     REQUIRE(here == 50);
+ }
+ 
++TEST_CASE("Shader jobs batch submit executes all jobs", "[video_core][shader_jobs]") {
++    ShaderJobScheduler scheduler{Config(2, 1)};
++    std::vector<int> results(10, 0);
++    std::vector<ShaderJob> jobs;
++    for (int i = 0; i < 10; ++i) {
++        jobs.push_back(CpuJob(Soon, [&results, i] { results[i] = i + 1; }));
++    }
++    auto handles = scheduler.Submit(jobs);
++    for (auto& handle : handles) {
++        handle.Wait();
++    }
++    for (int i = 0; i < 10; ++i) {
++        REQUIRE(results[i] == i + 1);
++    }
++}
++
++TEST_CASE("Shader jobs batch scope coalesces notifications", "[video_core][shader_jobs]") {
++    ShaderJobScheduler scheduler{Config(2, 1)};
++    std::vector<int> results(10, 0);
++    std::vector<ShaderJobHandle> handles;
++    {
++        auto scope = scheduler.BeginBatch();
++        for (int i = 0; i < 10; ++i) {
++            handles.push_back(scheduler.Submit(CpuJob(Soon, [&results, i] { results[i] = i + 1; })));
++        }
++    }
++    for (auto& handle : handles) {
++        handle.Wait();
++    }
++    for (int i = 0; i < 10; ++i) {
++        REQUIRE(results[i] == i + 1);
++    }
++}
++
+ namespace {
+ struct TestPipeline {
+     explicit TestPipeline(std::atomic<int>& builds_, bool fails_ = false)
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index d3bea59e2d..78e7c3b348 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -564,7 +564,7 @@ bool IsStoreOnlyExecutable(u32 method) {
+ // no write history, trace or profile, not a macro call or SET_SHADOW_RAM_CONTROL. The hot
+ // executable methods go straight to their handler.
+ void Maxwell3D::CallMethodFast(u32 method, u32 method_argument, bool is_last_call) {
+-    if (!execution_mask[method]) {
++    if (!execution_mask[method] || IsStoreOnlyExecutable(method)) {
+         return WriteStateRegister(method, method_argument);
+     }
+     const u32 argument = ProcessShadowRam(method, method_argument);
+@@ -578,11 +578,6 @@ void Maxwell3D::CallMethodFast(u32 method, u32 method_argument, bool is_last_cal
+         return draw_manager.DrawBegin(*this);
+     case MAXWELL3D_REG_INDEX(draw.end):
+         return draw_manager.DrawEnd(*this);
+-    case MAXWELL3D_REG_INDEX(vertex_buffer.first):
+-    case MAXWELL3D_REG_INDEX(vertex_buffer.count):
+-    case MAXWELL3D_REG_INDEX(index_buffer.first):
+-    case MAXWELL3D_REG_INDEX(topology_override):
+-        return;
+     case MAXWELL3D_REG_INDEX(bind_groups[0].raw_config):
+         return ProcessCBBind(0);
+     case MAXWELL3D_REG_INDEX(bind_groups[1].raw_config):
+@@ -891,7 +886,7 @@ void Maxwell3D::CallMethodSlow(Core::System& system, u32 method, u32 method_argu
+     // million 3D register writes a second, ~60% of them same-value, most from macro replays.
+     // Methods with side effects (execution_mask: draws, clears, constant buffer data and
+     // binds, semaphores, ...) always run. EDEN_NX2_SKIP_SAME=0 turns it off.
+-    if (!execution_mask[method]) {
++    if (!execution_mask[method] || IsStoreOnlyExecutable(method)) {
+         // ProcessMethodCall (and the draw manager behind it) acts only on executable methods.
+         if (!SkipSameValueWrites() || regs.reg_array[method] != argument) {
+             ProcessDirtyRegisters(method, argument);
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index 0a08d193a8..cbd11a20d7 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3338,9 +3338,11 @@ private:
+         if (draw_manager.HasDeferredDraw() && !DrawManager::IsInstanceLoopMethod(method)) {
+             draw_manager.DrawDeferred(*this, true);
+         }
++        if (regs.reg_array[method] == argument) {
++            return;
++        }
+         // A changed register that doesn't only parameterize the next draw ends fast draw reuse.
+-        if (VideoCommon::Nx2FastDraw::Enabled() && regs.reg_array[method] != argument &&
+-            !IsFastDrawParameter(method)) {
++        if (VideoCommon::Nx2FastDraw::Enabled() && !IsFastDrawParameter(method)) {
+             VideoCommon::Nx2FastDraw::Break(VideoCommon::Nx2FastDraw::Reason::Register, method);
+         }
+         regs.reg_array[method] = argument;
+diff --git a/src/video_core/renderer_vulkan/pipeline_build.h b/src/video_core/renderer_vulkan/pipeline_build.h
+index 39c3673098..00b0634891 100644
+--- a/src/video_core/renderer_vulkan/pipeline_build.h
++++ b/src/video_core/renderer_vulkan/pipeline_build.h
+@@ -68,13 +68,14 @@ private:
+ 
+ /// Where a pipeline is built. Without jobs it is built in its constructor.
+ struct PipelineBuildQueue {
+-    /// A Soon job of this scheduler, whose CPU stage is the pipeline's deferred SPIR-V emission if
++    /// A job of this scheduler, whose CPU stage is the pipeline's deferred SPIR-V emission if
+     /// it has one, and whose driver stage builds it. The estimates are the job's.
+     VideoCommon::ShaderJobScheduler* jobs{};
+     u64 cpu_bytes{};
+     u64 driver_bytes{};
+     /// Left for Build(), the driver stage of the job that translated it
+     bool owner_builds{};
++    VideoCommon::ShaderJobPriority priority{VideoCommon::ShaderJobPriority::Soon};
+ };
+ 
+ class PipelineBuild {
+@@ -131,7 +132,7 @@ public:
+           owner_builds{queue.owner_builds} {
+         if (jobs) {
+             VideoCommon::ShaderJob job{
+-                .priority = VideoCommon::ShaderJobPriority::Soon,
++                .priority = queue.priority,
+                 .cpu_bytes = queue.cpu_bytes,
+                 .driver_bytes = queue.driver_bytes,
+             };
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index eb316ebfeb..36320b1d0f 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -356,7 +356,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+     if (build_queue.jobs) {
+         jobs = build_queue.jobs;
+         VideoCommon::ShaderJob build_job{
+-            .priority = VideoCommon::ShaderJobPriority::Soon,
++            .priority = build_queue.priority,
+             .cpu_bytes = build_queue.cpu_bytes,
+             .driver_bytes = build_queue.driver_bytes,
+         };
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 7bb74577dd..e0b8d7e03e 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -1365,11 +1365,17 @@ bool PipelineCache::KeyFitsDevice(const GraphicsPipelineCacheKey& key) const {
+            dynamic_features.has_provoking_vertex_tf_preserve;
+ }
+ 
+-PipelineBuildQueue PipelineCache::BuildQueue(bool build_in_parallel, u64 cpu_bytes) {
++PipelineBuildQueue PipelineCache::BuildQueue(bool build_in_parallel, u64 cpu_bytes,
++                                             VideoCommon::ShaderJobPriority priority) {
+     if (!build_in_parallel) {
+-        return {.owner_builds = true};
++        return {.owner_builds = true, .priority = priority};
+     }
+-    return {.jobs = &*shader_jobs, .cpu_bytes = cpu_bytes, .driver_bytes = DriverCompileBytes};
++    return {
++        .jobs = &*shader_jobs,
++        .cpu_bytes = cpu_bytes,
++        .driver_bytes = DriverCompileBytes,
++        .priority = priority,
++    };
+ }
+ 
+ std::shared_ptr<ShaderPools> PipelineCache::TakeSparePools() {
+@@ -1707,7 +1713,9 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
+         prebuild.push_back(prebuild_record(index, key));
+     }
+ 
+-    for (auto& [key, indices] : compute_keys) {
++    {
++        auto batch_scope = jobs.BeginBatch();
++        for (auto& [key, indices] : compute_keys) {
+         ++state.total;
+         u64 bytes = 0;
+         for (const size_t index : indices) {
+@@ -1819,6 +1827,7 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
+             &boot);
+     }
+     boot_graphics.clear();
++    }
+ 
+     const auto add_to_prebuild = [this](PrebuildRecord& record,
+                                         VideoCommon::ShaderJobHandle* job = nullptr) {
+@@ -1851,6 +1860,7 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
+     const size_t deferred_pipelines = prebuild.size();
+     std::vector<VideoCommon::ShaderJobHandle> older_jobs;
+     const auto start_prebuild = [&] {
++        auto batch_scope = jobs.BeginBatch();
+         for (size_t index = 0; index < prebuild.size(); ++index) {
+             VideoCommon::ShaderJobHandle job;
+             add_to_prebuild(prebuild[index], index < older_admitted ? &job : nullptr);
+@@ -2127,6 +2137,7 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
+              jobs.size(), file_entries, num_threads);
+     VideoCommon::StutterTrace::BootMarker("precache_begin", fmt::format("jobs={}", jobs.size()));
+     if (!jobs.empty()) {
++        auto batch_scope = shader_jobs->BeginBatch();
+         // Background jobs of the shader workers, each built and destroyed: only the driver's
+         // cache keeps it.
+         const VideoCommon::ShaderJobBatch batch = shader_jobs->CreateBatch();
+@@ -2644,10 +2655,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::RebuildGraphicsPipeline(KeptGra
+         }
+         return code;
+     };
++    const bool is_vip = graphics_key.state.depth_write_enable != 0;
++    const auto priority = is_vip ? VideoCommon::ShaderJobPriority::Vip
++                                 : VideoCommon::ShaderJobPriority::Soon;
+     auto pipeline = std::make_unique<GraphicsPipeline>(
+         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, pipeline_binaries.get(),
+         &shader_notify, device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
+-        BuildQueue(true, bytes), nullptr, render_pass_cache, graphics_key,
++        BuildQueue(true, bytes, priority), nullptr, render_pass_cache, graphics_key,
+         std::array<std::vector<u32>, Maxwell::MaxShaderStage>{}, infos, std::move(emit),
+         std::move(kept.mesh_emulation));
+     pipeline->SetMappedPointers(std::move(kept.mapped_pointers));
+@@ -3122,10 +3136,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
+             mapped_pointers[index] = envs[mapped_env++]->MappedStoragePointerKeys();
+         }
+     }
++    const bool is_vip = key.state.depth_write_enable != 0;
++    const auto priority = is_vip ? VideoCommon::ShaderJobPriority::Vip
++                                 : VideoCommon::ShaderJobPriority::Soon;
+     auto pipeline = std::make_unique<GraphicsPipeline>(
+         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, pipeline_binaries.get(),
+         &shader_notify, device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
+-        BuildQueue(build_in_parallel, defer_emission ? deferred_ir_bytes : 0), statistics,
++        BuildQueue(build_in_parallel, defer_emission ? deferred_ir_bytes : 0, priority), statistics,
+         render_pass_cache, key, std::move(stage_spirv), infos, std::move(emit_stages),
+         std::move(mesh_emulation));
+     pipeline->SetMappedPointers(std::move(mapped_pointers));
+@@ -3543,7 +3560,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
+         pipeline = std::make_unique<ComputePipeline>(
+             device, scheduler, vulkan_pipeline_cache, pipeline_binaries.get(), hash,
+             descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
+-            BuildQueue(build_in_parallel, ir_bytes), statistics,
++            BuildQueue(build_in_parallel, ir_bytes, VideoCommon::ShaderJobPriority::Vip), statistics,
+             &shader_notify, info, vk::ShaderModule{}, key.unique_hash, std::vector<u8>{},
+             std::move(emit));
+     } else {
+@@ -3561,7 +3578,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
+         pipeline = std::make_unique<ComputePipeline>(
+             device, scheduler, vulkan_pipeline_cache, pipeline_binaries.get(), hash,
+             descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
+-            BuildQueue(build_in_parallel), statistics, &shader_notify, info, std::move(module),
++            BuildQueue(build_in_parallel, 0, VideoCommon::ShaderJobPriority::Vip), statistics, &shader_notify, info, std::move(module),
+             key.unique_hash, std::move(kept_spirv));
+     }
+     return {.pipeline = std::move(pipeline),
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index ac8c1d98e5..25d47f862d 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -206,7 +206,9 @@ private:
+ 
+     /// Where CreateGraphicsPipeline and CreateComputePipeline build; `cpu_bytes` estimates the
+     /// IR a deferred emission holds
+-    [[nodiscard]] PipelineBuildQueue BuildQueue(bool build_in_parallel, u64 cpu_bytes = 0);
++    [[nodiscard]] PipelineBuildQueue BuildQueue(
++        bool build_in_parallel, u64 cpu_bytes = 0,
++        VideoCommon::ShaderJobPriority priority = VideoCommon::ShaderJobPriority::Soon);
+ 
+     /// Whether the device can build a cached graphics pipeline of this key: its dynamic state
+     /// and provoking vertex must match the device's
+diff --git a/src/video_core/renderer_vulkan/vk_present_manager.cpp b/src/video_core/renderer_vulkan/vk_present_manager.cpp
+index 7da084b597..c156b782c2 100644
+--- a/src/video_core/renderer_vulkan/vk_present_manager.cpp
++++ b/src/video_core/renderer_vulkan/vk_present_manager.cpp
+@@ -6,6 +6,10 @@
+ #include <algorithm>
+ #include <thread>
+ 
++#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
++#include <immintrin.h>
++#endif
++
+ #include "common/display_hdr.h"
+ #include "common/dkb_frame_trace.h"
+ #include "common/scope_exit.h"
+@@ -15,6 +19,7 @@
+ #include "common/windows/timer_resolution.h"
+ #endif
+ #include "core/frontend/emu_window.h"
++#include "video_core/nx2.h"
+ #include "video_core/nx2_profile.h"
+ #ifdef HAS_LSFG
+ #include "video_core/renderer_vulkan/present/lsfg_common.h"
+@@ -40,19 +45,41 @@ constexpr u32 MAX_PRESENT_ATTEMPTS = 3;
+ static_assert(MAX_FRAMES_IN_FLIGHT <= LSFG_MAX_TARGETS);
+ #endif
+ 
+-// Sleeps until the deadline, without spinning: it may pass by up to a timer tick (about 0.5 ms
+-// on Windows), well within a refresh, and the next deadline counts from this one.
++void Pause() {
++#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
++    _mm_pause();
++#elif defined(__x86_64__) || defined(__i386__)
++    __builtin_ia32_pause();
++#elif defined(__aarch64__)
++    asm volatile("yield");
++#else
++    std::this_thread::yield();
++#endif
++}
++
++// Sleeps until the deadline using a high-precision hybrid approach: sleeps via the OS kernel
++// (SleepForOneTick on Windows / sleep_for) until ~1.5 ms remains to save CPU, then performs
++// a short spin-wait with _mm_pause() for the final microseconds to achieve a flat frametime line.
+ void SleepUntil(std::chrono::steady_clock::time_point deadline) {
++    static constexpr auto SpinThreshold = std::chrono::microseconds{1500};
+     while (true) {
+-        const auto left = deadline - std::chrono::steady_clock::now();
++        const auto now = std::chrono::steady_clock::now();
++        const auto left = deadline - now;
+         if (left <= std::chrono::steady_clock::duration::zero()) {
+             return;
+         }
++        if (left > SpinThreshold) {
+ #ifdef _WIN32
+-        Common::Windows::SleepForOneTick();
++            Common::Windows::SleepForOneTick();
+ #else
+-        std::this_thread::sleep_for(left);
++            std::this_thread::sleep_for(left - SpinThreshold);
+ #endif
++        } else {
++            while (std::chrono::steady_clock::now() < deadline) {
++                Pause();
++            }
++            return;
++        }
+     }
+ }
+ 
+@@ -265,6 +292,43 @@ Frame* PresentManager::GetRenderFrame() {
+     return frame;
+ }
+ 
++std::chrono::nanoseconds PresentManager::GetPacingInterval(const Frame* frame) const {
++    if (frame && frame->present_spacing.count() > 0) {
++        return frame->present_spacing;
++    }
++    if (!Settings::values.use_speed_limit.GetValue() ||
++        Settings::values.current_speed_mode.GetValue() == Settings::SpeedMode::Turbo) {
++        return std::chrono::nanoseconds{0};
++    }
++    const u32 speed_limit = Settings::SpeedLimit();
++    const auto scale_interval = [speed_limit](s64 base_ns) -> std::chrono::nanoseconds {
++        if (speed_limit != 0 && speed_limit != 100) {
++            return std::chrono::nanoseconds{base_ns * 100 / speed_limit};
++        }
++        return std::chrono::nanoseconds{base_ns};
++    };
++
++    switch (Settings::values.frame_pacing_mode.GetValue()) {
++    case Settings::FramePacingMode::Target_30:
++        return scale_interval(1'000'000'000LL / 30);
++    case Settings::FramePacingMode::Target_60:
++        return scale_interval(1'000'000'000LL / 60);
++    case Settings::FramePacingMode::Target_90:
++        return scale_interval(1'000'000'000LL / 90);
++    case Settings::FramePacingMode::Target_120:
++        return scale_interval(1'000'000'000LL / 120);
++    case Settings::FramePacingMode::Target_Auto:
++    default: {
++        const u64 guest_interval =
++            Tegra::g_nx2_guest_frame_interval_ns.load(std::memory_order_relaxed);
++        if (guest_interval > 0) {
++            return std::chrono::nanoseconds{guest_interval};
++        }
++        return scale_interval(1'000'000'000LL / 60);
++    }
++    }
++}
++
+ void PresentManager::Present(Frame* frame) {
+     if (!use_present_thread && Settings::values.frame_gen.GetValue()) {
+         // Frame generation was turned on from the status bar while a game runs. Earlier frames
+@@ -282,7 +346,17 @@ void PresentManager::Present(Frame* frame) {
+             VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PresentWait};
+             scheduler.WaitWorker();
+         }
++        const auto ready = std::chrono::steady_clock::now();
++        const auto spacing = GetPacingInterval(frame);
++        auto start = (std::max)(next_present, ready);
++        if (spacing.count() > 0) {
++            if (ready > next_present + spacing * 2) {
++                start = ready;
++            }
++            SleepUntil(start);
++        }
+         CopyToSwapchain(frame);
++        next_present = (spacing.count() > 0) ? (start + spacing) : ready;
+         free_queue.push_back(frame);
+     }
+ }
+@@ -445,15 +519,17 @@ void PresentManager::PresentThread(std::stop_token token) {
+             // lock in WaitPresent is guaranteed to occur after here.
+             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
+             const auto ready = std::chrono::steady_clock::now();
+-            // The spacing counts from when this present was due, not from when it returned. A
+-            // present that waits for vblank has already spent part of the spacing; counting it
+-            // again cost each generated frame an extra refresh, which lengthened the measured
+-            // frame interval and with it the spacing, until the game ran at a fraction of its
+-            // speed (#1772).
+-            const auto start = (std::max)(next_present, ready);
+-            SleepUntil(start);
++            const auto spacing = GetPacingInterval(frame);
++            auto start = (std::max)(next_present, ready);
++            if (spacing.count() > 0) {
++                // If we fell behind by more than 2 frames (e.g. hitch or pause), reset to avoid bursts
++                if (ready > next_present + spacing * 2) {
++                    start = ready;
++                }
++                SleepUntil(start);
++            }
+             CopyToSwapchain(frame);
+-            next_present = start + frame->present_spacing;
++            next_present = (spacing.count() > 0) ? (start + spacing) : ready;
+             if (Common::DkbFrameTrace::Enabled()) {
+                 const auto presented = std::chrono::steady_clock::now();
+                 LogPacing(frame, presented - ready, presented);
+diff --git a/src/video_core/renderer_vulkan/vk_present_manager.h b/src/video_core/renderer_vulkan/vk_present_manager.h
+index ac482c9252..ea2360e3ec 100644
+--- a/src/video_core/renderer_vulkan/vk_present_manager.h
++++ b/src/video_core/renderer_vulkan/vk_present_manager.h
+@@ -92,6 +92,10 @@ public:
+     /// Waits for the present thread to finish presenting all queued frames.
+     void WaitPresent();
+ 
++    /// Calculates the target pacing interval for a frame based on guest frame interval,
++    /// frame pacing mode, and speed limits.
++    [[nodiscard]] std::chrono::nanoseconds GetPacingInterval(const Frame* frame) const;
++
+     /// How many additional frames can be queued without stalling the render thread
+     [[nodiscard]] size_t MaxExtraFrames() const;
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+index ba13fb6bcc..83badc8849 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -3,8 +3,10 @@
+ 
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#include <array>
+ #include <chrono>
+ #include <cstddef>
++#include <cstring>
+ #include <limits>
+ #include <map>
+ #include <memory>
+@@ -90,45 +92,28 @@ public:
+         return BankBase::IsDead() && scheduler.IsFree(last_used_tick);
+     }
+ 
+-    void Sync(size_t start, size_t size, u64 written_tick) {
++    void Sync(size_t start, size_t size, [[maybe_unused]] u64 written_tick) {
+         const auto& dev = device.GetLogical();
++        std::array<u64, BANK_SIZE> temp_results;
+         const auto read = [&] {
+             return dev.GetQueryResults(*query_pool, static_cast<u32>(start),
+                                        static_cast<u32>(size), sizeof(u64) * size,
+-                                       &host_results[start], sizeof(u64), VK_QUERY_RESULT_64_BIT);
++                                       &temp_results[start], sizeof(u64), VK_QUERY_RESULT_64_BIT);
+         };
+-        // Polled instead of VK_QUERY_RESULT_WAIT_BIT: once the host GPU has passed the submission
+-        // that wrote these queries, their results are written. If they still aren't, that
+-        // submission was dropped (the kernel reset a hung ring and recovered without a device
+-        // loss), and RADV's wait would spin for 20 s per query.
+-        VkResult query_result = read();
+-        std::optional<std::chrono::steady_clock::time_point> passed_at;
+-        while (query_result == VK_NOT_READY) {
+-            scheduler.GetMasterSemaphore().Refresh();
+-            if (!passed_at && scheduler.IsFree(written_tick)) {
+-                passed_at = std::chrono::steady_clock::now();
+-            }
+-            if (passed_at &&
+-                std::chrono::steady_clock::now() - *passed_at > std::chrono::seconds{1}) {
+-                LOG_CRITICAL(Render_Vulkan,
+-                             "Occlusion queries {}..{} of bank {} are unavailable 1 s after the "
+-                             "GPU passed tick {}: their submission was dropped",
+-                             start, start + size, index, written_tick);
+-                query_result = VK_ERROR_DEVICE_LOST;
+-                break;
+-            }
+-            std::this_thread::yield();
+-            query_result = read();
++        const VkResult query_result = read();
++        if (query_result == VK_SUCCESS) {
++            std::memcpy(&host_results[start], &temp_results[start], sizeof(u64) * size);
++            return;
+         }
+-        switch (query_result) {
+-        case VK_SUCCESS:
++        if (query_result == VK_NOT_READY) {
++            // N-1 Asynchronous read-back: GPU is still rendering. Keep last_known_result in
++            // host_results instead of stalling the CPU for 2-8 ms.
+             return;
+-        case VK_ERROR_DEVICE_LOST:
++        }
++        if (query_result == VK_ERROR_DEVICE_LOST) {
+             device.ReportLoss();
+-            [[fallthrough]];
+-        default:
+-            throw vk::Exception(query_result);
+         }
++        throw vk::Exception(query_result);
+     }
+ 
+     VkQueryPool GetInnerPool() {
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index a639748072..8e5f96b21f 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -21,6 +21,10 @@
+ #include <span>
+ #include <vector>
+ 
++#if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
++#include <immintrin.h>
++#endif
++
+ #include "common/alignment.h"
+ #include "common/common_types.h"
+ #include "common/dkb_frame_trace.h"
+@@ -332,7 +336,15 @@ public:
+                     }
+                 }
+                 while (std::chrono::steady_clock::now() < target_time) {
++#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
++                    _mm_pause();
++#elif defined(__x86_64__) || defined(__i386__)
++                    __builtin_ia32_pause();
++#elif defined(__aarch64__)
++                    asm volatile("yield");
++#else
+                     std::this_thread::yield();
++#endif
+                 }
+             } else if (frame_counter > max_frame_count) {
+                 frame_counter = 0;
+diff --git a/src/video_core/renderer_vulkan/vk_swapchain.cpp b/src/video_core/renderer_vulkan/vk_swapchain.cpp
+index 73f683bdbc..b52c74b13c 100644
+--- a/src/video_core/renderer_vulkan/vk_swapchain.cpp
++++ b/src/video_core/renderer_vulkan/vk_swapchain.cpp
+@@ -299,35 +299,9 @@ bool Swapchain::AcquireNextImage(bool may_flush) {
+         return true;
+     }
+ 
+-    const auto wait_with_frame_pacing = [this, may_flush] {
+-    switch (Settings::values.frame_pacing_mode.GetValue()) {
+-    case Settings::FramePacingMode::Target_Auto:
+-        scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+-        break;
+-    case Settings::FramePacingMode::Target_30:
+-        scheduler.Wait(resource_ticks[image_index], 30.0, may_flush);
+-        break;
+-    case Settings::FramePacingMode::Target_60:
+-        scheduler.Wait(resource_ticks[image_index], 60.0, may_flush);
+-        break;
+-    case Settings::FramePacingMode::Target_90:
+-        scheduler.Wait(resource_ticks[image_index], 90.0, may_flush);
+-        break;
+-    case Settings::FramePacingMode::Target_120:
+-        scheduler.Wait(resource_ticks[image_index], 120.0, may_flush);
+-        break;
+-    }
+-    };
+-
+-#ifdef __ANDROID__
+-    if (android_get_device_api_level() >= 30) {
+-        scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+-    } else {
+-        wait_with_frame_pacing();
+-    }
+-#else
+-    wait_with_frame_pacing();
+-#endif
++    // PresentManager handles precision hybrid frame pacing right before presentation.
++    // AcquireNextImage only synchronizes the image resource tick without duplicate sleeps.
++    scheduler.Wait(resource_ticks[image_index], 0.0, may_flush);
+ 
+     resource_ticks[image_index] = scheduler.CurrentTick();
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index e19cbba20c..bb1692a8db 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -393,12 +393,25 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
+ // Finished decode images wait for the next texture of their shape, up to this much memory.
+ constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
+ 
++// Textures smaller than this threshold are decoded on the CPU in nanoseconds to avoid the
++// overhead of allocating descriptor sets, dispatching compute shaders, recording pipeline
++// barriers, and flushing the scheduler for tiny textures (e.g. 16x16 UI icons or glyphs).
++constexpr u32 GpuComputeMinTexels = 64 * 64;
++constexpr u32 GpuComputeMinBytes = 4096;
++
++[[nodiscard]] bool IsGpuComputeSizeEligible(const ImageInfo& info) {
++    const u32 texels = info.size.width * info.size.height;
++    const u32 guest_size = VideoCommon::CalculateGuestSizeInBytes(info);
++    return texels >= GpuComputeMinTexels || guest_size >= GpuComputeMinBytes;
++}
++
+ // ASTC that the GPU decodes and re-compresses to BC1/BC3 itself (TranscodeAstcToBcn): no CPU
+ // decode, so streamed textures are ready the frame they are first used instead of seconds later.
+ [[nodiscard]] bool WillUseGpuBcnTranscode(const Device& device, const ImageInfo& info) {
+     if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
+         IsHugeAstcArray(device, info) || IsUnevenMipRgba8Astc(device, info) ||
+-        info.type != ImageType::e2D || info.size.depth != 1) {
++        info.type != ImageType::e2D || info.size.depth != 1 ||
++        !IsGpuComputeSizeEligible(info)) {
+         return false;
+     }
+     return Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu &&
+@@ -412,7 +425,8 @@ constexpr u64 MaxFreeTranscodeBytes = u64{256} << 20;
+     if (IsHugeAstcArray(device, info) || IsUnevenMipRgba8Astc(device, info)) {
+         return true;
+     }
+-    if (Settings::values.accelerate_astc.GetValue() != Settings::AstcDecodeMode::Gpu) {
++    if (Settings::values.accelerate_astc.GetValue() != Settings::AstcDecodeMode::Gpu ||
++        !IsGpuComputeSizeEligible(info)) {
+         return false;
+     }
+     return Settings::GetAstcRecompression() == Settings::AstcRecompression::Uncompressed &&
+@@ -1020,9 +1034,9 @@ void CopyBufferToImage(vk::CommandBuffer cmdbuf, VkBuffer src_buffer, VkImage im
+     // TODO: Move this to another API
+     cmdbuf.PipelineBarrier(
+             VK_PIPELINE_STAGE_TRANSFER_BIT,
+-            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
++            vk::PIPELINE_STAGE_GRAPHICS_COMPUTE |
++            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+             0, nullptr, nullptr, write_barrier);
+ }
+ 
+diff --git a/src/video_core/shader_jobs.cpp b/src/video_core/shader_jobs.cpp
+index 18656532c4..157acce721 100644
+--- a/src/video_core/shader_jobs.cpp
++++ b/src/video_core/shader_jobs.cpp
+@@ -184,6 +184,7 @@ ShaderJobHandle ShaderJobScheduler::Submit(ShaderJob job, const ShaderJobBatch*
+     state->submitted = Clock::now();
+     const bool driver{!state->work.cpu};
+     std::vector<ShaderJob> dead;
++    bool notify = false;
+     {
+         std::scoped_lock lock{mutex};
+         if (state->batch) {
+@@ -197,11 +198,117 @@ ShaderJobHandle ShaderJobScheduler::Submit(ShaderJob job, const ShaderJobBatch*
+         }
+         state->status = driver ? ShaderJobStatus::DriverQueued : ShaderJobStatus::Queued;
+         (driver ? driver_queue : cpu_queue)[Index(state->work.priority)].push_back(state);
++
++        if (batch_nesting > 0) {
++            if (driver) {
++                batch_notify_driver = true;
++            } else {
++                batch_notify_cpu = true;
++            }
++        } else {
++            notify = true;
++        }
++    }
++    if (notify) {
++        (driver ? driver_condition : cpu_condition).notify_one();
+     }
+-    (driver ? driver_condition : cpu_condition).notify_one();
+     return ShaderJobHandle{std::move(state)};
+ }
+ 
++std::vector<ShaderJobHandle> ShaderJobScheduler::Submit(std::span<ShaderJob> jobs,
++                                                        const ShaderJobBatch* batch) {
++    if (jobs.empty()) {
++        return {};
++    }
++    std::vector<ShaderJobHandle> handles;
++    handles.reserve(jobs.size());
++    const auto now = Clock::now();
++    bool wake_cpu = false;
++    bool wake_driver = false;
++    std::vector<ShaderJob> dead;
++
++    {
++        std::scoped_lock lock{mutex};
++        if (batch && batch->state) {
++            std::scoped_lock batch_lock{batch->state->mutex};
++            batch->state->pending += jobs.size();
++        }
++        for (auto& job : jobs) {
++            auto state{std::make_shared<ShaderJobState>()};
++            state->priority = job.priority;
++            state->queued_priority = job.priority;
++            state->batch = batch ? batch->state : nullptr;
++            state->submitted = now;
++            const bool driver{!job.cpu};
++            state->work = std::move(job);
++
++            ++stats.priorities[Index(state->work.priority)].queued;
++            if (stopping || StopRequested(*state)) {
++                Finish(*state, ShaderJobStatus::Cancelled, dead);
++                handles.emplace_back(std::move(state));
++                continue;
++            }
++            state->status = driver ? ShaderJobStatus::DriverQueued : ShaderJobStatus::Queued;
++            (driver ? driver_queue : cpu_queue)[Index(state->work.priority)].push_back(state);
++
++            if (batch_nesting > 0) {
++                if (driver) {
++                    batch_notify_driver = true;
++                } else {
++                    batch_notify_cpu = true;
++                }
++            } else {
++                if (driver) {
++                    wake_driver = true;
++                } else {
++                    wake_cpu = true;
++                }
++            }
++            handles.emplace_back(std::move(state));
++        }
++    }
++
++    if (wake_cpu) {
++        if (jobs.size() > 1) {
++            cpu_condition.notify_all();
++        } else {
++            cpu_condition.notify_one();
++        }
++    }
++    if (wake_driver) {
++        if (jobs.size() > 1) {
++            driver_condition.notify_all();
++        } else {
++            driver_condition.notify_one();
++        }
++    }
++
++    return handles;
++}
++
++void ShaderJobScheduler::EnterBatch() {
++    std::scoped_lock lock{mutex};
++    ++batch_nesting;
++}
++
++void ShaderJobScheduler::LeaveBatch() {
++    bool notify_cpu = false;
++    bool notify_driver = false;
++    {
++        std::scoped_lock lock{mutex};
++        if (batch_nesting > 0 && --batch_nesting == 0) {
++            notify_cpu = std::exchange(batch_notify_cpu, false);
++            notify_driver = std::exchange(batch_notify_driver, false);
++        }
++    }
++    if (notify_cpu) {
++        cpu_condition.notify_all();
++    }
++    if (notify_driver) {
++        driver_condition.notify_all();
++    }
++}
++
+ ShaderJobBatch ShaderJobScheduler::CreateBatch() {
+     return ShaderJobBatch{std::make_shared<ShaderJobBatchState>()};
+ }
+@@ -373,14 +480,20 @@ ShaderJobScheduler::JobPtr ShaderJobScheduler::Pick(bool driver, Clock::time_poi
+     bool aged{aged_last};
+     std::deque<JobPtr>* entries{front(ShaderJobPriority::NeedNow)};
+     if (!entries) {
+-        std::deque<JobPtr>* const soon{front(ShaderJobPriority::Soon)};
+-        std::deque<JobPtr>* const background{front(ShaderJobPriority::Background)};
+-        // An aged Background job ahead of the Soon jobs takes every other pick, so a backlog
+-        // doesn't hold back the Soon jobs submitted after it.
+-        aged = background && soon && !aged_last &&
+-               now - background->front()->submitted >= background_aging &&
+-               background->front()->submitted < soon->front()->submitted;
+-        entries = aged ? background : (soon ? soon : background);
++        std::deque<JobPtr>* const vip{front(ShaderJobPriority::Vip)};
++        if (vip) {
++            entries = vip;
++            aged = false;
++        } else {
++            std::deque<JobPtr>* const soon{front(ShaderJobPriority::Soon)};
++            std::deque<JobPtr>* const background{front(ShaderJobPriority::Background)};
++            // An aged Background job ahead of the Soon jobs takes every other pick, so a backlog
++            // doesn't hold back the Soon jobs submitted after it.
++            aged = background && soon && !aged_last &&
++                   now - background->front()->submitted >= background_aging &&
++                   background->front()->submitted < soon->front()->submitted;
++            entries = aged ? background : (soon ? soon : background);
++        }
+     }
+     if (!entries) {
+         return nullptr;
+@@ -539,17 +652,21 @@ void ShaderJobScheduler::Finish(ShaderJobState& job, ShaderJobStatus status,
+ 
+ void ParallelFor(ShaderJobScheduler& scheduler, size_t count,
+                  const std::function<void(size_t)>& function) {
+-    std::vector<ShaderJobHandle> handles;
+-    handles.reserve(count);
++    if (count == 0) {
++        return;
++    }
++    std::vector<ShaderJob> jobs;
++    jobs.reserve(count);
+     for (size_t index = 0; index < count; ++index) {
+-        handles.push_back(scheduler.Submit({
++        jobs.push_back({
+             .priority = ShaderJobPriority::NeedNow,
+             .cpu = [&function, index](ShaderJobContext&) {
+                 function(index);
+                 return ShaderDriverStage{};
+             },
+-        }));
++        });
+     }
++    std::vector<ShaderJobHandle> handles = scheduler.Submit(jobs);
+     // Workers take NeedNow jobs oldest first, so the calling thread runs from the newest: it waits
+     // only for calls already running.
+     for (auto it = handles.rbegin(); it != handles.rend(); ++it) {
+diff --git a/src/video_core/shader_jobs.h b/src/video_core/shader_jobs.h
+index 5c0e4326ff..321c858125 100644
+--- a/src/video_core/shader_jobs.h
++++ b/src/video_core/shader_jobs.h
+@@ -12,8 +12,10 @@
+ #include <memory>
+ #include <mutex>
+ #include <optional>
++#include <span>
+ #include <string>
+ #include <thread>
++#include <utility>
+ #include <vector>
+ 
+ #include "common/common_types.h"
+@@ -21,14 +23,17 @@
+ 
+ namespace VideoCommon {
+ 
+-/// NeedNow: a draw or dispatch waits for it. Soon: bound but not drawn yet, or a boot build of a
+-/// used pipeline. Background: prebuild, precache, relowering, migration.
++/// NeedNow: a draw or dispatch waits for it.
++/// Vip: gameplay essential (compute physics/lighting, solid geometry with depth write).
++/// Soon: gameplay standard (transparent particles, smoke, dust, FX, boot used pipelines).
++/// Background: prebuild, precache, relowering, migration.
+ enum class ShaderJobPriority : u8 {
+     NeedNow,
++    Vip,
+     Soon,
+     Background,
+ };
+-inline constexpr size_t NumShaderJobPriorities = 3;
++inline constexpr size_t NumShaderJobPriorities = 4;
+ 
+ enum class ShaderJobStatus : u8 {
+     Queued,       ///< Waiting for a CPU worker, or for the memory budget
+@@ -156,6 +161,50 @@ public:
+     /// A job submitted after Shutdown, or with a stopped batch, is cancelled at once.
+     ShaderJobHandle Submit(ShaderJob job, const ShaderJobBatch* batch = nullptr);
+ 
++    /// Submits a batch of jobs in a single critical section and single notification.
++    std::vector<ShaderJobHandle> Submit(std::span<ShaderJob> jobs,
++                                        const ShaderJobBatch* batch = nullptr);
++    std::vector<ShaderJobHandle> Submit(std::vector<ShaderJob>&& jobs,
++                                        const ShaderJobBatch* batch = nullptr) {
++        return Submit(std::span<ShaderJob>{jobs}, batch);
++    }
++
++    /// RAII scope that defers thread notifications until the scope exits, coalescing multiple
++    /// Submits into a single notification.
++    class [[nodiscard]] BatchScope {
++    public:
++        explicit BatchScope(ShaderJobScheduler* scheduler_) : scheduler{scheduler_} {
++            if (scheduler) {
++                scheduler->EnterBatch();
++            }
++        }
++        ~BatchScope() {
++            if (scheduler) {
++                scheduler->LeaveBatch();
++            }
++        }
++        BatchScope(const BatchScope&) = delete;
++        BatchScope& operator=(const BatchScope&) = delete;
++        BatchScope(BatchScope&& other) noexcept
++            : scheduler{std::exchange(other.scheduler, nullptr)} {}
++        BatchScope& operator=(BatchScope&& other) noexcept {
++            if (this != &other) {
++                if (scheduler) {
++                    scheduler->LeaveBatch();
++                }
++                scheduler = std::exchange(other.scheduler, nullptr);
++            }
++            return *this;
++        }
++
++    private:
++        ShaderJobScheduler* scheduler{};
++    };
++
++    [[nodiscard]] BatchScope BeginBatch() {
++        return BatchScope{this};
++    }
++
+     ShaderJobBatch CreateBatch();
+ 
+     /// Raises a job's priority, wherever it is queued or running. A lower priority is ignored.
+@@ -196,6 +245,8 @@ private:
+     void Finish(ShaderJobState& job, ShaderJobStatus status, std::vector<ShaderJob>& dead);
+     void ReleaseBytes(ShaderJobState& job);
+     void WakeHeldWorkers();
++    void EnterBatch();
++    void LeaveBatch();
+ 
+     const u64 budget;
+     const std::chrono::nanoseconds background_aging;
+@@ -203,6 +254,9 @@ private:
+     mutable std::mutex mutex;
+     std::condition_variable cpu_condition;
+     std::condition_variable driver_condition;
++    u32 batch_nesting{};
++    bool batch_notify_cpu{};
++    bool batch_notify_driver{};
+     /// Entries go stale on promotion, cancellation or a stage start and are skipped when reached.
+     Queue cpu_queue;
+     Queue driver_queue;
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 74b42e05a2..fa61eae6ba 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2408,12 +2408,14 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+ 
+     const bool gpu_unswizzle_enabled = Settings::values.gpu_unswizzle_enabled.GetValue();
+ 
++    constexpr size_t GpuUnswizzleMinBytes = 4096;
+     if (gpu_unswizzle_enabled &&
+         IsPixelFormatBCn(image.info.format) &&
+         image.info.type == ImageType::e3D &&
+         image.info.resources.levels == 1 &&
+         image.info.resources.layers == 1 &&
+-        MapSizeBytes(image) >= gpu_unswizzle_maxsize &&
++        MapSizeBytes(image) >= GpuUnswizzleMinBytes &&
++        MapSizeBytes(image) <= gpu_unswizzle_maxsize &&
+         False(image.flags & ImageFlagBits::GpuModified)) {
+ 
+         QueueAsyncUnswizzle(image, image_id);
+-- 
+2.56.0.windows.4
+

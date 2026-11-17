@@ -84,7 +84,7 @@ SWITCHABLE(RendererBackend, true);
 SWITCHABLE(ScalingFilter, false);
 SWITCHABLE(SpirvOptimizeMode, true);
 SWITCHABLE(TimeZone, true);
-SETTING(VSyncMode, true);
+SWITCHABLE(VSyncMode, true);
 SWITCHABLE(bool, false);
 SWITCHABLE(int, false);
 SWITCHABLE(int, true);

@@ -31,6 +31,7 @@ void ForEachRecommendedSetting(Values& settings, Func&& func) {
     entry(settings.accelerate_astc, AstcDecodeMode::Gpu);
     entry(settings.frame_pacing_mode, FramePacingMode::Target_Auto);
     entry(settings.astc_recompression, AstcRecompression::Bc3);
+    entry(settings.vsync_mode, VSyncMode::Mailbox);
     entry(settings.sync_memory_operations, false);
     entry(settings.renderer_force_max_clock, false);
     entry(settings.use_disk_shader_cache, true);

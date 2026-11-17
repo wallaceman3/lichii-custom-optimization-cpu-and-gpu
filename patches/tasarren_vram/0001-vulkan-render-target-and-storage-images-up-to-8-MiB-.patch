@@ -1,0 +1,187 @@
+From 109e52be2111ff2e18443f6229a9a64ad7a619cd Mon Sep 17 00:00:00 2001
+From: Tasa <tasarren@underaft.com>
+Date: Sat, 14 Nov 2026 19:57:18 +0100
+Subject: [PATCH 1/3] vulkan: render target and storage images up to 8 MiB in a
+ VMA pool of their own
+
+---
+ .../vulkan_common/vulkan_device.cpp           |  4 +-
+ src/video_core/vulkan_common/vulkan_device.h  | 13 +++-
+ .../vulkan_common/vulkan_memory_allocator.cpp | 74 ++++++++++++++++++-
+ .../vulkan_common/vulkan_memory_allocator.h   |  7 ++
+ 4 files changed, 91 insertions(+), 7 deletions(-)
+
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index 687fe3ab98..7bea1df6a2 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -1115,10 +1115,10 @@ VideoCommon::Fsr4PortDevice Device::Fsr4PortDevice() const {
+     };
+ }
+ 
+-VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
++VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type, bool create) const {
+     std::scoped_lock lk{separate_pools_mutex};
+     VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
+-    if (pool == VK_NULL_HANDLE) {
++    if (pool == VK_NULL_HANDLE && create) {
+         const VmaPoolCreateInfo ci{
+             .memoryTypeIndex = memory_type,
+             .flags = 0,
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index bba5e4db98..6788ce0f47 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -285,14 +285,19 @@ public:
+ 
+     /// Allocations kept out of the default blocks, which then hold images only: churned buffers
+     /// and long-lived sparse pages left holes the texture cache's collector couldn't drain.
++    /// RenderTargets: attachment and storage images up to half a block. They are created and
++    /// freed by the thousand and left the default blocks full of small holes.
+     enum class SeparatePool : u32 {
+         SparsePages,
+         DeviceBuffers,
++        RenderTargets,
++        Count,
+     };
+     static constexpr VkDeviceSize SeparatePoolBlockSize = 16ULL << 20;
+ 
+-    /// The pool of that kind for a memory type, created on first use (null if that failed).
+-    VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type) const;
++    /// The pool of that kind for a memory type, created on first use unless !create (null if
++    /// that failed or it doesn't exist).
++    VmaPool GetSeparatePool(SeparatePool kind, u32 memory_type, bool create = true) const;
+ 
+     /// Returns the logical device.
+     const vk::Device& GetLogical() const {
+@@ -1348,7 +1353,9 @@ private:
+     VkInstance instance;         ///< Vulkan instance.
+     VmaAllocator allocator{};    ///< VMA allocator.
+     mutable std::mutex separate_pools_mutex;
+-    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>, 2> separate_pools{};
++    mutable std::array<std::array<VmaPool, VK_MAX_MEMORY_TYPES>,
++                       static_cast<size_t>(SeparatePool::Count)>
++        separate_pools{};
+     vk::DeviceDispatch dld;      ///< Device function pointers.
+     vk::PhysicalDevice physical; ///< Physical device.
+     vk::Device logical;          ///< Logical device.
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index 7873f9b9b9..c0dae75fed 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -271,8 +271,11 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
+         }
+     }
+     const bool huge = IsTooLargeToBack(texels, bytes);
+-    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+-                           : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
++    VkResult result =
++        huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
++        : !dedicated && CreateImageInSeparatePool(ci, alloc_ci, handle, allocation, alloc_info)
++            ? VK_SUCCESS
++            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
+         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
+         // it out rather than failing the draw and aborting.
+@@ -452,6 +455,48 @@ void MemoryAllocator::FreeSparseMemory(VmaAllocation allocation) const {
+     }
+ }
+ 
++bool MemoryAllocator::CreateImageInSeparatePool(const VkImageCreateInfo& ci,
++                                                const VmaAllocationCreateInfo& alloc_ci,
++                                                VkImage& handle, VmaAllocation& allocation,
++                                                VmaAllocationInfo& alloc_info) const {
++    // Render targets and storage images up to half a block: in a pool of their own (see
++    // Device::SeparatePool). Larger ones, and any that fails here, take the default path.
++    constexpr VkImageUsageFlags target_usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
++                                               VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
++                                               VK_IMAGE_USAGE_STORAGE_BIT;
++    if ((ci.usage & target_usage) == 0) {
++        return false;
++    }
++    const auto& dld = device.GetDispatchLoader();
++    const VkDevice logical = *device.GetLogical();
++    VkImage image{};
++    if (dld.vkCreateImage(logical, &ci, nullptr, &image) != VK_SUCCESS) {
++        return false;
++    }
++    const VkMemoryRequirements requirements = device.GetLogical().GetImageMemoryRequirements(image);
++    u32 memory_type{};
++    if (requirements.size <= Device::SeparatePoolBlockSize / 2 &&
++        vmaFindMemoryTypeIndex(allocator, requirements.memoryTypeBits, &alloc_ci, &memory_type) ==
++            VK_SUCCESS) {
++        if (const VmaPool pool =
++                device.GetSeparatePool(Device::SeparatePool::RenderTargets, memory_type)) {
++            VmaAllocationCreateInfo pool_ci = alloc_ci;
++            pool_ci.pool = pool;
++            if (vmaAllocateMemoryForImage(allocator, image, &pool_ci, &allocation, &alloc_info) ==
++                VK_SUCCESS) {
++                if (vmaBindImageMemory(allocator, allocation, image) == VK_SUCCESS) {
++                    handle = image;
++                    return true;
++                }
++                vmaFreeMemory(allocator, allocation);
++                allocation = VK_NULL_HANDLE;
++            }
++        }
++    }
++    dld.vkDestroyImage(logical, image, nullptr);
++    return false;
++}
++
+ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, MemoryUsage usage,
+                                                  const VmaAllocationCreateInfo& alloc_ci,
+                                                  VkBuffer& handle, VmaAllocation& allocation,
+@@ -795,6 +840,31 @@ void LogMemoryTrace(const Device& device) {
+                        d.allocationSizeMax >> 20);
+     }
+     LOG_INFO(Render_Vulkan, "Memory trace: types {}", types);
++    // The separate pools, which the type totals above include.
++    static constexpr std::array pool_names{"sparse pages", "device buffers", "render targets"};
++    static_assert(pool_names.size() == static_cast<size_t>(Device::SeparatePool::Count));
++    std::string pools;
++    for (u32 kind = 0; kind < pool_names.size(); ++kind) {
++        for (u32 type = 0; type < properties->memoryTypeCount; ++type) {
++            const VmaPool pool =
++                device.GetSeparatePool(static_cast<Device::SeparatePool>(kind), type, false);
++            if (pool == VK_NULL_HANDLE) {
++                continue;
++            }
++            VmaDetailedStatistics d{};
++            vmaCalculatePoolStatistics(allocator, pool, &d);
++            fmt::format_to(std::back_inserter(pools),
++                           "{}{} (type {}): {} allocs {}/{} MiB in {} blocks, {} free ranges "
++                           "(largest {} MiB)",
++                           pools.empty() ? "" : "; ", pool_names[kind], type,
++                           d.statistics.allocationCount, d.statistics.allocationBytes >> 20,
++                           d.statistics.blockBytes >> 20, d.statistics.blockCount,
++                           d.unusedRangeCount, d.unusedRangeSizeMax >> 20);
++        }
++    }
++    if (!pools.empty()) {
++        LOG_INFO(Render_Vulkan, "Memory trace: pools {}", pools);
++    }
+ }
+ 
+ void LogMemoryStatistics(const Device& device) {
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.h b/src/video_core/vulkan_common/vulkan_memory_allocator.h
+index 49c72e9773..f09ea552e7 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.h
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.h
+@@ -117,6 +117,13 @@ namespace Vulkan {
+         /// aliased: its sparse blocks may share memory (VK_IMAGE_CREATE_SPARSE_ALIASED_BIT).
+         vk::Image CreateUnbackedImage(const VkImageCreateInfo &ci, bool aliased = false) const;
+ 
++        /// Render target and storage images in their own VMA pool; false when it doesn't apply
++        /// or failed.
++        bool CreateImageInSeparatePool(const VkImageCreateInfo& ci,
++                                       const VmaAllocationCreateInfo& alloc_ci, VkImage& handle,
++                                       VmaAllocation& allocation,
++                                       VmaAllocationInfo& alloc_info) const;
++
+         /// Device memory to bind to part of a sparse resource. Null when there is none left.
+         /// Device-local buffers in their own VMA pool; false when it doesn't apply or failed.
+         bool CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, MemoryUsage usage,
+-- 
+2.56.0.windows.4
+

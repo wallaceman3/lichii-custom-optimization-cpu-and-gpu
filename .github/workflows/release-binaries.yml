@@ -90,30 +90,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: linux-x86_64
-            runner: ubuntu-24.04
-          # The Linux -pgo builds are the same programs compiled by clang against the repo's
-          # eglantine.profdata. Eden's profile (Eden-CI/PGO) comes from Switch 1 games: with it Mario
-          # Kart World ran at about half the speed of the normal build, with eglantine.profdata at
-          # about the same speed. Both Windows builds are clang-cl with ThinLTO; windows-x86_64-pgo
-          # adds lichii-windows.profdata, an MSVC-ABI profile trained on Ocarina of Time (see
-          # docs/CI.md). MSVC still builds for development.
-          - platform: linux-x86_64-pgo
-            runner: ubuntu-24.04
-            pgo: true
-          - platform: windows-x86_64
-            runner: windows-2022
+          # Windows PGO only (isolated for fast builds, zero queue delay and 100% dedicated sccache)
           - platform: windows-x86_64-pgo
             runner: windows-2022
             pgo: true
             profile: lichii-windows.profdata
-          - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
-          - platform: linux-aarch64-pgo
-            runner: ubuntu-24.04-arm
-            pgo: true
-          - platform: macos-arm64
-            runner: macos-15
+          # Other platforms (re-enable when releasing full multi-platform packages):
+          # - platform: windows-x86_64
+          #   runner: windows-2022
+          # - platform: linux-x86_64-pgo
+          #   runner: ubuntu-24.04
+          #   pgo: true
+          # - platform: linux-x86_64
+          #   runner: ubuntu-24.04
+          # - platform: linux-aarch64-pgo
+          #   runner: ubuntu-24.04-arm
+          #   pgo: true
+          # - platform: linux-aarch64
+          #   runner: ubuntu-24.04-arm
+          # - platform: macos-arm64
+          #   runner: macos-15
 
     steps:
       - name: Check out source
@@ -422,7 +418,9 @@ jobs:
       - name: Stop sccache on Windows
         if: always() && startsWith(matrix.platform, 'windows') && steps.compiler-cache.outcome == 'success'
         shell: pwsh
-        run: sccache --stop-server
+        run: |
+          try { sccache --stop-server } catch {}
+          exit 0
 
       - name: Save compiler objects
         if: always() && steps.compiler-cache.outcome == 'success'
@@ -696,21 +694,25 @@ jobs:
           # Asset names drop the commit sha: the release tag already identifies the build, and
           # stable names let the notes table link to them.
           strip_sha() { sed "s/-${GITHUB_SHA}//" <<< "$1"; }
-          for artifact in artifacts/*/; do
-            name=$(basename "$artifact")
-            if compgen -G "$artifact*.AppImage" > /dev/null; then
-              # Linux: ship the AppImage and the tar.gz as they are.
-              for file in "$artifact"*.AppImage "$artifact"*.tar.gz; do
-                cp "$file" "dist/$(strip_sha "$(basename "$file")")"
-              done
-            elif compgen -G "$artifact*.zip" > /dev/null; then
-              for file in "$artifact"*.zip "$artifact"*.dmg; do
-                [[ -e "$file" ]] && cp "$file" "dist/$(strip_sha "$(basename "$file")")"
-              done
-            else
-              (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/$(strip_sha "$name").zip" .)
-            fi
-          done
+          if [[ -f artifacts/lichii.exe ]]; then
+            (cd artifacts && zip -qr "${GITHUB_WORKSPACE}/dist/lichii-windows-x86_64-pgo.zip" .)
+          else
+            for artifact in artifacts/*/; do
+              name=$(basename "$artifact")
+              if compgen -G "$artifact*.AppImage" > /dev/null; then
+                # Linux: ship the AppImage and the tar.gz as they are.
+                for file in "$artifact"*.AppImage "$artifact"*.tar.gz; do
+                  cp "$file" "dist/$(strip_sha "$(basename "$file")")"
+                done
+              elif compgen -G "$artifact*.zip" > /dev/null; then
+                for file in "$artifact"*.zip "$artifact"*.dmg; do
+                  [[ -e "$file" ]] && cp "$file" "dist/$(strip_sha "$(basename "$file")")"
+                done
+              else
+                (cd "$artifact" && zip -qr "${GITHUB_WORKSPACE}/dist/$(strip_sha "$name").zip" .)
+              fi
+            done
+          fi
           ls -la dist
 
       - name: Create release
