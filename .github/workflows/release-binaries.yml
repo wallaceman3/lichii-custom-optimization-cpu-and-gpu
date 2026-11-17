@@ -90,25 +90,26 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Windows PGO is prioritized first: clang-cl with ThinLTO and lichii-windows.profdata profile
+          # Windows PGO only (isolated for fast builds, zero queue delay and 100% dedicated sccache)
           - platform: windows-x86_64-pgo
             runner: windows-2022
             pgo: true
             profile: lichii-windows.profdata
-          - platform: windows-x86_64
-            runner: windows-2022
-          - platform: linux-x86_64-pgo
-            runner: ubuntu-24.04
-            pgo: true
-          - platform: linux-x86_64
-            runner: ubuntu-24.04
-          - platform: linux-aarch64-pgo
-            runner: ubuntu-24.04-arm
-            pgo: true
-          - platform: linux-aarch64
-            runner: ubuntu-24.04-arm
-          - platform: macos-arm64
-            runner: macos-15
+          # Other platforms (re-enable when releasing full multi-platform packages):
+          # - platform: windows-x86_64
+          #   runner: windows-2022
+          # - platform: linux-x86_64-pgo
+          #   runner: ubuntu-24.04
+          #   pgo: true
+          # - platform: linux-x86_64
+          #   runner: ubuntu-24.04
+          # - platform: linux-aarch64-pgo
+          #   runner: ubuntu-24.04-arm
+          #   pgo: true
+          # - platform: linux-aarch64
+          #   runner: ubuntu-24.04-arm
+          # - platform: macos-arm64
+          #   runner: macos-15
 
     steps:
       - name: Check out source
