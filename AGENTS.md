@@ -9,8 +9,8 @@ Keep comments to a reasonable level. Do not overexplain or add/remove comments f
 - **NUNCA enviar ideias de implementações futuras, rascunhos ou roadmaps para o Git:**
   - Ideias de implementações futuras, planejamentos e rascunhos conceituais devem permanecer **estritamente locais** no PC do usuário, na pasta `D:\Games\YUZU\EMULADOR\SWITCH 2\Lichii-Otimizacoes-e-Patches\`.
   - O repositório Git DEVE conter apenas código funcional já implementado e documentação de recursos existentes e testados.
-- **NUNCA mencionar "Antigravity", IA ou ferramentas de agente no Git:**
-  - O repositório Git (incluindo `README.md`, commits, mensagens de PR e código-fonte) NÃO deve conter nenhuma referência a "Antigravity", "AI Agent", "Agent Skill" ou ferramentas geradas por IA. O repositório deve manter a aparência estrita de um desenvolvimento manual padrão C++.
+- **NUNCA mencionar IA, assistentes ou ferramentas de automação no Git:**
+  - O repositório Git (incluindo `README.md`, commits, mensagens de PR e código-fonte) NÃO deve conter nenhuma referência a assistentes de IA, skills ou ferramentas automatizadas de agentes. O repositório deve manter a aparência estrita de um desenvolvimento manual padrão C++.
 - **Always update `README.md` on every new upload/release to Git:**
   - Clearly document all custom CPU and GPU optimizations included in the build.
   - Maintain complete credits to upstream authors (Zortos) and contributors (Tasarren for VRAM and memory optimizations).
