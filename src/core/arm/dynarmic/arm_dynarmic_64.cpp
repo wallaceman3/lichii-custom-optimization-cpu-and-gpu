@@ -296,7 +296,7 @@ u64 DynarmicCallbacks64::GetCNTPCT() {
         return value == nullptr || value[0] != '0';
     }();
     if (pause_spins && ticks - m_last_cntpct < m_spin_ticks) {
-        if (++m_consecutive_spin_polls >= 2000) {
+        if (++m_consecutive_spin_polls >= 256) {
             m_consecutive_spin_polls = 0;
             std::this_thread::yield();
         } else {

@@ -64,6 +64,11 @@ An enhanced, high-performance fork of **[zortos293/Lichii](https://github.com/zo
 - Employs an ultra-short adaptive pause micro-spin loop prior to invoking the kernel condition variable wait during GPU-to-CPU read synchronization (`OnCPURead`).
 - Eliminates Windows kernel context switches and thread descheduling when fast discrete GPUs complete transfers in microseconds, with reliable fallback to kernel waits if transfers take longer.
 
+### 11. Multi-Entry Associative UBO Stream Cache (16-Way per Slot)
+- Upgrades uniform stream buffer reuse with a 16-way associative history cache per slot indexed by `device_addr` and verified with fast 64-bit CityHash comparison.
+- Eliminates repeated mapped staging allocations and memory copy overhead during round-robin draw call rendering across multi-actor scenes (e.g., 12-kart racing packs).
+- Elevates `MissStreak` tolerance to 32 to prevent cache deactivation when distinct actor matrices alternate continuously within a frame.
+
 ---
 
 ## 🎮 Recommended Settings Guide
