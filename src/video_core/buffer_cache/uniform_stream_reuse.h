@@ -176,7 +176,7 @@ template <class Runtime, class DeviceMemory>
             // Same device_addr but bytes changed: update this entry directly
             const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
             std::memcpy(span.data(), scratch, size);
-            const Ref new_ref = runtime.LastStreamUniformRef();
+            const auto new_ref = runtime.LastStreamUniformRef();
             slot.ref = new_ref;
             slot.tick = current_tick;
             slot.device_addr = device_addr;
