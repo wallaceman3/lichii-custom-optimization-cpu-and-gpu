@@ -56,6 +56,14 @@ An enhanced, high-performance fork of **[zortos293/Lichii](https://github.com/zo
   - **> 85% VRAM (Emergency):** High-throughput eviction (15 frames, 128 iterations/frame) to swiftly reclaim space before driver OOM limits.
 - **Allocation & ShaderCacheWriter Memory Shield:** Protected with `try/catch` exception handlers in `JoinImages` and `CacheWriter` to ensure low-commit spikes or cache write delays never trigger process aborts.
 
+### 9. Draw Submission Batching (`DefaultNativeBudget = 256`)
+- Elevates native desktop submission batching from 128 to 256 draw calls, cutting Vulkan queue recording and submission frequency in half on 6-core CPUs while keeping discrete GPUs continuously supplied with work.
+- Guarantees immediate flushing on swapchain present and key render target transitions.
+
+### 10. Low-Latency Micro-Spin for GPU Readbacks (`WaitForSyncOperation`)
+- Employs an ultra-short adaptive pause micro-spin loop prior to invoking the kernel condition variable wait during GPU-to-CPU read synchronization (`OnCPURead`).
+- Eliminates Windows kernel context switches and thread descheduling when fast discrete GPUs complete transfers in microseconds, with reliable fallback to kernel waits if transfers take longer.
+
 ---
 
 ## 🎮 Recommended Settings Guide
