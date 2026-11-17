@@ -4,6 +4,13 @@ See `docs/Coding.md` for technical coding guidance.
 
 Keep comments to a reasonable level. Do not overexplain or add/remove comments from unrelated parts of the codebase.
 
+## Documentation & Release Rules
+
+- **Always update `README.md` on every new upload/release to Git:**
+  - Clearly document all custom CPU and GPU optimizations included in the build.
+  - Maintain complete credits to upstream authors (Zortos) and contributors (Tasarren for VRAM and memory optimizations).
+  - Keep the recommended settings guide accurate and up-to-date.
+
 ## Game bug reports
 
 Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Each `Booting game: <program id>` line starts a session; the build is on the first line (`Lichii Version: ... | nx2-<sha>`). Known program ids:
