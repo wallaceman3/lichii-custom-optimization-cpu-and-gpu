@@ -245,7 +245,7 @@ std::vector<ShaderJobHandle> ShaderJobScheduler::Submit(std::span<ShaderJob> job
             ++stats.priorities[Index(state->work.priority)].queued;
             if (stopping || StopRequested(*state)) {
                 Finish(*state, ShaderJobStatus::Cancelled, dead);
-                handles.emplace_back(std::move(state));
+                handles.push_back(ShaderJobHandle{std::move(state)});
                 continue;
             }
             state->status = driver ? ShaderJobStatus::DriverQueued : ShaderJobStatus::Queued;
@@ -264,7 +264,7 @@ std::vector<ShaderJobHandle> ShaderJobScheduler::Submit(std::span<ShaderJob> job
                     wake_cpu = true;
                 }
             }
-            handles.emplace_back(std::move(state));
+            handles.push_back(ShaderJobHandle{std::move(state)});
         }
     }
 

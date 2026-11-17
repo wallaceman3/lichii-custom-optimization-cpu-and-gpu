@@ -83,9 +83,10 @@ public:
     /// What a stage threw, once the job failed.
     std::exception_ptr Exception() const;
 
+    explicit ShaderJobHandle(std::shared_ptr<ShaderJobState> state_) : state{std::move(state_)} {}
+
 private:
     friend class ShaderJobScheduler;
-    explicit ShaderJobHandle(std::shared_ptr<ShaderJobState> state_) : state{std::move(state_)} {}
 
     std::shared_ptr<ShaderJobState> state;
 };
