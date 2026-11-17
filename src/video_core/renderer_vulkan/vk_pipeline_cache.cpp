@@ -2154,11 +2154,12 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
              jobs.size(), file_entries, num_threads);
     VideoCommon::StutterTrace::BootMarker("precache_begin", fmt::format("jobs={}", jobs.size()));
     if (!jobs.empty()) {
-        auto batch_scope = shader_jobs->BeginBatch();
         // Background jobs of the shader workers, each built and destroyed: only the driver's
         // cache keeps it.
         const VideoCommon::ShaderJobBatch batch = shader_jobs->CreateBatch();
-        for (size_t index = 0; index < jobs.size(); ++index) {
+        {
+            auto batch_scope = shader_jobs->BeginBatch();
+            for (size_t index = 0; index < jobs.size(); ++index) {
             shader_jobs->Submit(
                 {
                     .priority = VideoCommon::ShaderJobPriority::Background,
@@ -2191,6 +2192,7 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
                     },
                 },
                 &batch);
+            }
         }
         while (!batch.Idle()) {
             if (stop_loading.stop_requested() || ShaderWarm::TakeSkipWarm()) {
