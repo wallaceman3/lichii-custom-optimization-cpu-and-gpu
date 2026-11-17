@@ -15,6 +15,8 @@ Keep comments to a reasonable level. Do not overexplain or add/remove comments f
   - Clearly document all custom CPU and GPU optimizations included in the build.
   - Maintain complete credits to upstream authors (Zortos) and contributors (Tasarren for VRAM and memory optimizations).
   - Keep the recommended settings guide accurate and up-to-date.
+- **Excluir compilações falhadas do GitHub Actions após correção:**
+  - Sempre que ocorrer um erro em uma compilação/workflow no GitHub Actions, assim que a correção for efetuada, a execução com falha deve ser excluída imediatamente do histórico de actions via API/interface antes ou logo após disparar o novo build, mantendo o histórico de CI limpo.
 
 ## Game bug reports
 
