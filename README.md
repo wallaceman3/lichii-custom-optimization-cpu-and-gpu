@@ -34,7 +34,8 @@ An enhanced, high-performance fork of **[zortos293/Lichii](https://github.com/zo
 
 ### 5. Precision Hybrid Frame Pacing (`PresentManager` + Mailbox)
 - **`VK_PRESENT_MODE_MAILBOX_KHR`:** Decouples the emulator from rigid FIFO VSync half-rate drops (no more 60 $\to$ 30 FPS drops on 0.1 ms misses).
-- **Hybrid `SleepUntil`:** Uses kernel OS sleep until ~1.5 ms before target presentation, finishing with an ultra-short microsecond spin-wait with `_mm_pause()` (x86) / `yield` (ARM).
+- **Zero-Stall Mailbox & Auto Presentation:** In Mailbox VSync and Auto pacing modes, avoids redundant CPU spin-waits and artificial thread delays, delivering fresh frames immediately to the swapchain for maximum throughput on 6-core CPUs.
+- **Hybrid `SleepUntil`:** For fixed target modes (30/60 FPS), uses kernel OS sleep with a trimmed 250 µs spin-wait to save CPU cycles.
 - **Anti-Burst Protection:** Resets pacing cadence after loading screens or long hitches to prevent fast-forward frame bursts.
 
 ### 6. Asynchronous N-1 Occlusion Queries
@@ -45,9 +46,8 @@ An enhanced, high-performance fork of **[zortos293/Lichii](https://github.com/zo
 - Automatically detects tight spin-loops in Dynarmic (`GetCNTPCT`) and yields the physical host CPU thread after 2,000 tight iterations.
 - Detects `svcSleepThread(0)` and explicit yield SVCs to prevent idle guest threads from burning 100% of a physical CPU core.
 
-### 8. VRAM Reduction, 3-Tier GC & Pool Defragmentation (Credits: Tasarren)
-- **Dedicated VMA Pool for Render Targets & Storage Images:** Allocates render target and storage images up to 8 MiB in a dedicated VMA pool capped at 512 MiB, preventing severe VRAM fragmentation while allowing heavy scenes to overflow dynamically without hard limits.
-- **4 MiB Buffer Blocks:** Sized with a 2 MiB cut-off for optimal device buffer allocation.
+### 8. VRAM Reduction, 3-Tier GC & Memory Architecture (Credits: Tasarren)
+- **Direct VMA Memory Allocation:** Streamlines image creation directly through Vulkan Memory Allocator to eliminate probe/destruction overhead while preserving 4 MiB buffer blocks.
 - **Dynamic VRAM Target (85% DXGI Budget):** Soft target caps device memory usage to 85% of available budget (~6.1 GB on 8 GB cards), reserving ample head-room for Windows DWM and preventing system commit exhaustion.
 - **Discrete GPU Memory Threshold Protection:** Distinguishes integrated GPUs from discrete GPUs so non-texture allocations never inadvertently inflate discrete GPU retention floors up to the physical memory limit.
 - **3-Tier Texture Garbage Collector (Anti-Thrashing):**

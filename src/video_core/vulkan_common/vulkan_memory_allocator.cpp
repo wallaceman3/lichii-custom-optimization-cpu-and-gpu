@@ -270,9 +270,7 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
     const bool huge = IsTooLargeToBack(texels, bytes);
     VkResult result =
         huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-        : !dedicated && CreateImageInSeparatePool(ci, alloc_ci, handle, allocation, alloc_info)
-            ? VK_SUCCESS
-            : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+             : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.

@@ -61,7 +61,7 @@ void Pause() {
 // (SleepForOneTick on Windows / sleep_for) until ~1.5 ms remains to save CPU, then performs
 // a short spin-wait with _mm_pause() for the final microseconds to achieve a flat frametime line.
 void SleepUntil(std::chrono::steady_clock::time_point deadline) {
-    static constexpr auto SpinThreshold = std::chrono::microseconds{1500};
+    static constexpr auto SpinThreshold = std::chrono::microseconds{250};
     while (true) {
         const auto now = std::chrono::steady_clock::now();
         const auto left = deadline - now;
@@ -347,17 +347,21 @@ void PresentManager::Present(Frame* frame) {
             VideoCommon::Nx2Profile::Scope scope{VideoCommon::Nx2Profile::Zone::PresentWait};
             scheduler.WaitWorker();
         }
-        const auto ready = std::chrono::steady_clock::now();
-        const auto spacing = GetPacingInterval(frame);
-        auto start = (std::max)(next_present, ready);
-        if (spacing.count() > 0) {
-            if (ready > next_present + spacing * 2) {
-                start = ready;
+        const bool is_mailbox = Settings::values.vsync_mode.GetValue() == Settings::VSyncMode::Mailbox;
+        const bool is_auto = Settings::values.frame_pacing_mode.GetValue() == Settings::FramePacingMode::Target_Auto;
+        if (!is_mailbox && !is_auto) {
+            const auto ready = std::chrono::steady_clock::now();
+            const auto spacing = GetPacingInterval(frame);
+            auto start = (std::max)(next_present, ready);
+            if (spacing.count() > 0) {
+                if (ready > next_present + spacing * 2) {
+                    start = ready;
+                }
+                SleepUntil(start);
             }
-            SleepUntil(start);
+            next_present = (spacing.count() > 0) ? (start + spacing) : ready;
         }
         CopyToSwapchain(frame);
-        next_present = (spacing.count() > 0) ? (start + spacing) : ready;
         free_queue.push_back(frame);
     }
 }
@@ -524,18 +528,22 @@ void PresentManager::PresentThread(std::stop_token token) {
             // before the queue lock goes out of scope. This way the swapchain
             // lock in WaitPresent is guaranteed to occur after here.
             void(std::exchange(lock, std::unique_lock{swapchain_mutex}));
-            const auto ready = std::chrono::steady_clock::now();
-            const auto spacing = GetPacingInterval(frame);
-            auto start = (std::max)(next_present, ready);
-            if (spacing.count() > 0) {
-                // If we fell behind by more than 2 frames (e.g. hitch or pause), reset to avoid bursts
-                if (ready > next_present + spacing * 2) {
-                    start = ready;
+            const bool is_mailbox = Settings::values.vsync_mode.GetValue() == Settings::VSyncMode::Mailbox;
+            const bool is_auto = Settings::values.frame_pacing_mode.GetValue() == Settings::FramePacingMode::Target_Auto;
+            if (!is_mailbox && !is_auto) {
+                const auto ready = std::chrono::steady_clock::now();
+                const auto spacing = GetPacingInterval(frame);
+                auto start = (std::max)(next_present, ready);
+                if (spacing.count() > 0) {
+                    // If we fell behind by more than 2 frames (e.g. hitch or pause), reset to avoid bursts
+                    if (ready > next_present + spacing * 2) {
+                        start = ready;
+                    }
+                    SleepUntil(start);
                 }
-                SleepUntil(start);
+                next_present = (spacing.count() > 0) ? (start + spacing) : ready;
             }
             CopyToSwapchain(frame);
-            next_present = (spacing.count() > 0) ? (start + spacing) : ready;
             if (Common::DkbFrameTrace::Enabled()) {
                 const auto presented = std::chrono::steady_clock::now();
                 LogPacing(frame, presented - ready, presented);
