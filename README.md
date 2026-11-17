@@ -78,6 +78,8 @@ Open **Emulation > Configure** (or `Ctrl+,`):
 * **Graphics:**
   - **Resolution:** 1X (720p/1080p).
   - **VSync Mode:** `Mailbox` (configured by default for flat frametimes).
+  - **Scaling Filter:** `ScaleForce` (superior edge sharpness without the ~1 ms overhead of FSR3 or bloom blow-up on water) or `Bilinear` (maximum CPU/GPU efficiency).
+  - **Anti-Aliasing Method:** `None` (preserves distant sharpness and prevents texture blurring caused by FXAA at native 1080p).
   - **ASTC Recompression:** `BC3` (or Uncompressed if VRAM $\ge 8$ GB).
   - **ASTC Decode Method:** `GPU`.
 * **Advanced Graphics:**
