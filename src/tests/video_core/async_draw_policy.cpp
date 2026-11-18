@@ -70,3 +70,18 @@ TEST_CASE("A native draw needs history on every render target it writes, through
     REQUIRE_FALSE(Vulkan::ColorWritesHaveHistory(2, identity, none, writes_all));
     REQUIRE_FALSE(Vulkan::ColorWritesHaveHistory(0, identity, writes_all, writes_all));
 }
+
+TEST_CASE("Transient 2D particle draws with history can discard; font atlases wait",
+          "[video_core][async_draw]") {
+    // Star Fox font atlas (30-672 vertices, single instance): never discarded even with history.
+    for (const u32 count : {30u, 96u, 384u, 672u}) {
+        REQUIRE_FALSE(Vulkan::CanDiscardTransient2DDraw(true, true, false, count, 1));
+        REQUIRE_FALSE(Vulkan::CanDiscardTransient2DDraw(true, false, false, count, 1));
+    }
+    // Transient instanced or large 2D particle effects into an existing target can be discarded.
+    REQUIRE(Vulkan::CanDiscardTransient2DDraw(true, true, false, 24, 16));
+    REQUIRE(Vulkan::CanDiscardTransient2DDraw(true, true, false, 2048, 1));
+    // First-frame targets without history or mesh draws never discard.
+    REQUIRE_FALSE(Vulkan::CanDiscardTransient2DDraw(true, false, false, 2048, 16));
+    REQUIRE_FALSE(Vulkan::CanDiscardTransient2DDraw(true, true, true, 2048, 16));
+}

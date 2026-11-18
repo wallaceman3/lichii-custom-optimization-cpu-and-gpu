@@ -154,6 +154,49 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
 }
 
 template <class P>
+void TextureCache<P>::DeleteSupersededImages() {
+    // Ocarina of Time moves its render targets within a memory pool every frame while the camera
+    // moves (about 45 images a frame in the Castle Town guard house), far more than the
+    // collector removes. Once the memory of an image belongs entirely to newer images (see
+    // ClassifySuperseded for what that has to prove) nothing can read it any more.
+    static constexpr u64 MinFramesUnused = 2;
+    if (!Tegra::g_nx2_ampere.load(std::memory_order_relaxed) || frame_tick <= MinFramesUnused ||
+        frame_tick - superseded_activity_frame > MinFramesUnused + 1) {
+        return;
+    }
+    superseded_ids.clear();
+    lru_cache.ForEachItemBelow(frame_tick - MinFramesUnused, [this](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (image.overlapping_images.empty()) {
+            return false;
+        }
+        switch (ClassifySuperseded(slot_images, image)) {
+        case Supersession::Clean:
+        case Supersession::Rewritten:
+            superseded_ids.push_back(image_id);
+            break;
+        case Supersession::Unproven:
+            ++superseded_unproven;
+            break;
+        case Supersession::None:
+            break;
+        }
+        return false;
+    });
+    for (const ImageId image_id : superseded_ids) {
+        Image& image = slot_images[image_id];
+        ++(image.IsSafeGpuCopy() ? superseded_rewritten_deletes : superseded_clean_deletes);
+        // Not marked stale (MarkStale): the covering images hold the bytes, and marking their
+        // pages would let an image made over them skip its upload without being filled.
+        if (True(image.flags & ImageFlagBits::Tracked)) {
+            UntrackImage(image, image_id);
+        }
+        UnregisterImage(image_id);
+        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+    }
+}
+
+template <class P>
 void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     const StutterTrace::SiteScope site{StutterTrace::Site::TextureCollect};
     bool high_priority_mode = false;
@@ -1641,6 +1684,13 @@ void TextureCache<P>::TickFrame() {
                  "for buffer-written pages; {} MiB of pages marked stale",
                  tc_stale_skips, tc_stale_skip_bytes >> 20, tc_stale_gpu_written,
                  (stale_pages.Count() << StalePages::PAGE_BITS) >> 20);
+        LOG_INFO(HW_GPU,
+                 "Texture cache last 600 frames: superseded images deleted {} ({} held GPU data "
+                 "rewritten by newer images); GPU-written candidates without that proof, summed "
+                 "over frames: {}",
+                 superseded_clean_deletes + superseded_rewritten_deletes,
+                 superseded_rewritten_deletes, superseded_unproven);
+        superseded_clean_deletes = superseded_rewritten_deletes = superseded_unproven = 0;
         tc_stale_skips = tc_stale_skip_bytes = tc_stale_gpu_written = 0;
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
         astc_opaque_images = astc_alpha_images = 0;
@@ -1668,6 +1718,7 @@ void TextureCache<P>::TickFrame() {
         out_of_memory = failed != seen_failed_images;
         seen_failed_images = failed;
     }
+    DeleteSupersededImages();
     // A forced collect for memory spilled to host memory collects as at the critical threshold
     // for this frame, without the re-upload of images left out that a failed image gets.
     if (out_of_memory || spill_collect || total_used_memory > minimum_memory) {
@@ -4621,6 +4672,9 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         join_alias_indices.emplace(aliased_id, alias_index);
         new_image.flags |= ImageFlagBits::Alias;
     }
+    if (!join_bad_overlap_ids.empty()) {
+        superseded_activity_frame = frame_tick;
+    }
     for (const ImageId aliased_id : join_bad_overlap_ids) {
         ImageBase& aliased = slot_images[aliased_id];
         aliased.overlapping_images.push_back(new_image_id);
@@ -5739,6 +5793,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         }
     }
     lru_cache.Touch(image.lru_index, frame_tick);
+    image.last_use_frame = frame_tick;
 }
 
 template <class P>
@@ -5970,6 +6025,10 @@ void TextureCache<P>::NoteClearedWhole() {
         ImageBase& image = slot_images[slot_image_views[id].image_id];
         if (ClearWritesWhole(image.info, image.gpu_addr)) {
             image.load_tick = image.modification_tick;
+            if (slot_image_views[id].size == image.info.size) {
+                image.full_write_tick = image.modification_tick;
+                superseded_activity_frame = frame_tick;
+            }
         }
     };
     for (const ImageViewId id : render_targets.color_buffer_ids) {

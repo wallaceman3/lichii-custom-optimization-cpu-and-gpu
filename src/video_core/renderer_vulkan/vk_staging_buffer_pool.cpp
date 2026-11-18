@@ -138,10 +138,12 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
     auto node = cache_level.deferred.extract(ref.index);
     ASSERT(!node.empty());
     node.mapped().tick = scheduler.CurrentTick();
+    node.mapped().last_used_frame = frame_counter;
     cache_level.entries.push_back(std::move(node.mapped()));
 }
 
 void StagingBufferPool::TickFrame() {
+    ++frame_counter;
     current_delete_level = (current_delete_level + 1) % NUM_LEVELS;
 
     ReleaseCache(MemoryUsage::DeviceLocal);
@@ -219,6 +221,7 @@ std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t s
     }
     const size_t position = static_cast<size_t>(std::distance(entries.begin(), it));
     const StagingBufferRef ref = it->Ref();
+    it->last_used_frame = frame_counter;
     if (!deferred) {
         cache_level.iterate_index = position + 1;
         it->tick = scheduler.CurrentTick();
@@ -316,6 +319,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage
         .log2_level = log2_size,
         .index = unique_ids++,
         .tick = scheduler.CurrentTick(),
+        .last_used_frame = frame_counter,
     };
     const StagingBufferRef ref = entry.Ref();
     StagingBuffers& cache_level = GetCache(usage)[log2_size];
@@ -383,16 +387,29 @@ void StagingBufferPool::ReleaseLevel(StagingBuffersCache& cache, size_t log2) {
     auto& entries = staging.entries;
     const size_t old_size = entries.size();
 
-    // Keep two idle upload buffers per level up to 32 MiB (under 128 MiB in all). Each level is
-    // swept every 64 frames, so after a pause each upload over 8 MiB (past the stream buffer's
-    // regions) got a new dedicated allocation, written to for the first time (16 MiB on an
-    // RTX 4080, idle system: 0.4 ms to create, 1.2 ms more for the first write).
+    // Hybrid retention for upload staging buffers:
+    // - Up to 32 MiB (KeepMaxLog2 = 25): keep up to 2 idle buffers permanently.
+    // - Above 32 MiB up to 512 MiB (GiantMaxLog2 = 29, covering 64-288 MiB texture uploads):
+    //   keep at most 1 idle buffer transiently for ~2 seconds (120 frames) to avoid synchronous
+    //   vkCreateBuffer/vkAllocateMemory stalls on back-to-back large uploads without pinning
+    //   hundreds of MiB in 16 GB host RAM.
     constexpr size_t KeepMaxLog2 = 25;
     constexpr size_t KeepPerLevel = 2;
-    if (&cache == &upload_cache && log2 <= KeepMaxLog2) {
+    constexpr size_t GiantMaxLog2 = 29;
+    constexpr size_t KeepGiantPerLevel = 1;
+    constexpr u64 GiantRetentionFrames = 120;
+    if (&cache == &upload_cache && log2 <= GiantMaxLog2) {
+        const size_t max_keep = log2 <= KeepMaxLog2 ? KeepPerLevel : KeepGiantPerLevel;
+        const bool is_giant = log2 > KeepMaxLog2;
         size_t idle = 0;
-        std::erase_if(entries, [this, &idle](const StagingBuffer& entry) {
-            return scheduler.IsFree(entry.tick) && ++idle > KeepPerLevel;
+        std::erase_if(entries, [this, &idle, max_keep, is_giant](const StagingBuffer& entry) {
+            if (!scheduler.IsFree(entry.tick)) {
+                return false;
+            }
+            if (is_giant && frame_counter - entry.last_used_frame >= GiantRetentionFrames) {
+                return true;
+            }
+            return ++idle > max_keep;
         });
         staging.delete_index = 0;
         if (staging.iterate_index > entries.size()) {

@@ -96,6 +96,17 @@ An enhanced, high-performance fork of **[zortos293/Lichii](https://github.com/zo
 - Caps software video decoding worker threads based on host CPU topology (`thread_count = 2` on $\le 6$-thread CPUs, with `libdav1d` `framethreads`/`max_frame_delay` tuned to `2` and `tilethreads = 1` when no hardware decoder is active), preventing AV1 cutscenes from saturating guest CPU cores.
 - Expands the decoded frame buffer queue (`MaxDecodedAhead = 5`) in `INx2VideoSession` to absorb software decode jitter and maintain smooth cutscene pacing.
 
+### 18. Hybrid Staging Buffer Pool (`StagingBufferPool`)
+- Retains upload staging buffers up to 32 MiB permanently (2 per level) while adding a transient 120-frame (~2 s) TTL retention window for giant upload buffers (64 MiB–512 MiB, covering 288 MiB texture uploads).
+- Eliminates synchronous `vkCreateBuffer` / `vkAllocateMemory` stalls on consecutive large texture uploads without permanently pinning hundreds of MiB on 16 GB RAM systems.
+
+### 19. Immediate Superseded Render Target Cleanup (`ClassifySuperseded`, Credits: Tasarren)
+- Detects render targets and overlapping images whose guest memory range has been completely covered by newer cleared images (`full_write_tick`) at frame boundaries (`DeleteSupersededImages`), releasing their VRAM after 2 unused frames without waiting for the full GC cycle.
+
+### 20. Memory-Aware Boot Shader Budget & Transient 2D Draw Heuristic
+- **Dynamic Boot Shader Cap (`ComputeDynamicBootPipelineCap`):** Sizes cold-cache boot shader precompilation dynamically from available host RAM and GPU VRAM budget (clamped between 1,024 and 32,768 pipelines) while respecting `KeptPipelines()`.
+- **Transient 2D Effect Heuristic (`CanDiscardTransient2DDraw`):** Allows asynchronous pipeline compilation for large or instanced transient 2D particle/effect draws into existing render targets without depth testing, while keeping persistent font atlas draws (30–672 vertices) strictly synchronous.
+
 ---
 
 ## 🎮 Recommended Settings Guide

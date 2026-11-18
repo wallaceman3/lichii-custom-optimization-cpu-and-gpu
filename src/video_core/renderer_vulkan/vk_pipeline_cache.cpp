@@ -948,11 +948,22 @@ u8 MaxUsedPipelineAge(const Device& device) {
 }
 
 // Without a list of the pipelines recent sessions used (the first boot with this cache, or a session
-// that ended before saving it), this many cached graphics pipelines at most are built at boot and the
-// rest when first needed. A cache that grew over many builds held 48k pipelines, ~21 GB of driver
-// memory built before the game started; the list is only saved at exit or after two minutes, so a
-// boot that ran out of memory never saved one and the next boot did the same.
-constexpr size_t MaxPipelinesWithoutUsedList = 3000;
+// that ended before saving it), size the boot precompilation budget dynamically from host RAM and
+// GPU VRAM after reserving OS and guest base memory.
+size_t ComputeDynamicBootPipelineCap(const Device& device) {
+    using namespace Common::Literals;
+    const u64 total_ram = Common::GetMemInfo().TotalPhysicalMemory;
+    const u64 vram_budget = device.GetDeviceMemoryBudget();
+    const u64 ram_reserve = total_ram >= 12_GiB ? 6_GiB : 3_GiB;
+    const u64 free_ram = total_ram > ram_reserve ? total_ram - ram_reserve : 512_MiB;
+    const u64 vram_reserve = vram_budget >= 6_GiB ? 2560_MiB : 1536_MiB;
+    const u64 free_vram = vram_budget > vram_reserve ? vram_budget - vram_reserve : 256_MiB;
+    constexpr u64 AvgRamPerPipeline = 300_KiB;
+    constexpr u64 AvgVramPerPipeline = 128_KiB;
+    const size_t by_ram = static_cast<size_t>(free_ram / AvgRamPerPipeline);
+    const size_t by_vram = static_cast<size_t>(free_vram / AvgVramPerPipeline);
+    return std::clamp<size_t>(std::min(by_ram, by_vram), 1024, 32768);
+}
 
 // Shader cache v2: bytes a job's stage is taken to hold for the scheduler's budget. EGLA-80
 // measured ~100 MiB of commit per driver compile in flight (24 at once held ~2.5 GB more than
@@ -1657,8 +1668,11 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
     // under the pipelines kept built
     const bool build_all = Settings::values.build_all_cached_shaders.GetValue();
     const size_t kept_pipelines = KeptPipelines();
+    const size_t dynamic_boot_cap = ComputeDynamicBootPipelineCap(device);
+    const size_t max_pipelines_without_used_list =
+        kept_pipelines != 0 ? std::min(dynamic_boot_cap, kept_pipelines) : dynamic_boot_cap;
     const size_t boot_used =
-        used_pipelines.empty() ? MaxPipelinesWithoutUsedList : used_pipelines.size();
+        used_pipelines.empty() ? max_pipelines_without_used_list : used_pipelines.size();
     const size_t spare_pipelines = kept_pipelines == 0
                                        ? std::numeric_limits<size_t>::max()
                                        : kept_pipelines - std::min(kept_pipelines, boot_used);
@@ -1710,7 +1724,7 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
             older_used.push_back({index, *key, used_age->second});
             continue;
         }
-        const bool used = used_pipelines.empty() ? queued_graphics < MaxPipelinesWithoutUsedList
+        const bool used = used_pipelines.empty() ? queued_graphics < max_pipelines_without_used_list
                                                  : used_age != used_pipelines.end();
         const bool spare = !used && build_all && queued_spare < spare_pipelines;
         if (used || spare) {
@@ -1983,7 +1997,7 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
             MaxUsedPipelineAge(device));
         const std::string chosen =
             used_pipelines.empty() ? fmt::format("no used list: the first {} graphics records",
-                                                 MaxPipelinesWithoutUsedList)
+                                                 max_pipelines_without_used_list)
                                    : fmt::format("the used list of {} pipelines from {} sessions",
                                                  used_pipelines.size(), used_sessions);
         LOG_INFO(
@@ -2672,16 +2686,20 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
                regs.rt[rt_index].format != Tegra::RenderTargetFormat::NONE &&
                regs.color_mask[regs.color_mask_common ? 0 : rt_index].raw != 0;
     };
+    const bool has_color_history =
+        native &&
+        ColorWritesHaveHistory(
+            std::min<u32>(regs.rt_control.count, static_cast<u32>(Maxwell::NumRenderTargets)),
+            [&regs](u32 i) { return regs.rt_control.Map(i); }, writes_color,
+            [this](u32 rt_index) {
+                return texture_cache.ColorTargetWrittenBeforeThisFrame(rt_index);
+            });
     const bool depth_tested =
-        native ? mode != NativePendingMode::Wait && regs.zeta_enable != 0 &&
-                     regs.depth_test_enable != 0 && !regs.IsMeshEnabled() &&
-                     ColorWritesHaveHistory(
-                         std::min<u32>(regs.rt_control.count,
-                                       static_cast<u32>(Maxwell::NumRenderTargets)),
-                         [&regs](u32 i) { return regs.rt_control.Map(i); }, writes_color,
-                         [this](u32 rt_index) {
-                             return texture_cache.ColorTargetWrittenBeforeThisFrame(rt_index);
-                         })
+        native ? mode != NativePendingMode::Wait && !regs.IsMeshEnabled() && has_color_history &&
+                     ((regs.zeta_enable != 0 && regs.depth_test_enable != 0) ||
+                      CanDiscardTransient2DDraw(true, has_color_history, false,
+                                                draw_state.draw_element_count,
+                                                draw_state.instance_count))
                : regs.zeta_enable != 0;
     // Native draws are judged by the heuristic only when a mode other than Wait is chosen.
     const bool can_discard = CanDiscardPendingDraw(

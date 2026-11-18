@@ -33,6 +33,18 @@ constexpr bool CanDiscardPendingDraw(bool native, bool depth_enabled, u32 index_
     return depth_enabled || (index_count > 6 && vertex_count > 6);
 }
 
+/// Whether a native draw without depth testing is a transient 2D particle/effect draw rather than
+/// a persistent resource/font atlas build.
+/// Star Fox builds persistent font atlases with 30-672 vertices, instance_count <= 1, and into
+/// targets without prior frame history; those must always wait.
+constexpr bool CanDiscardTransient2DDraw(bool native, bool has_color_history, bool is_mesh,
+                                         u32 element_count, u32 instance_count) {
+    if (!native || !has_color_history || is_mesh) {
+        return false;
+    }
+    return element_count > 1024 || instance_count > 1;
+}
+
 /// Whether a draw writes color, and only into render targets first written in an earlier frame,
 /// so skipping it leaves last frame's image rather than an unwritten one (Eglantine #874).
 /// @param count       Color outputs of the draw (rt_control.count).
