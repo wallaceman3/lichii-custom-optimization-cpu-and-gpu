@@ -15,9 +15,10 @@ An enhanced, high-performance fork of **[zortos293/Lichii](https://github.com/zo
 
 ## 🚀 Key Optimizations in this Build
 
-### 1. Smart Shader Worker Scaling (`GetSmartPipelineWorkers`)
-- **Gameplay Protection:** On 6-core/6-thread CPUs (e.g., Core i5-9400F, i5-8400, Ryzen 3500), shader compilation threads are balanced to **2 CPU + 1 Driver** worker during gameplay, preventing thread thrashing and starving the guest CPU, audio, and Vulkan threads.
-- Scalable dynamic profiles for 4-thread, 8-thread, 12-thread, and 16+ thread CPUs.
+### 1. Smart Shader Worker Scaling & Boot Turbo Mode (`GetSmartPipelineWorkers`)
+- **Boot Turbo Acceleration:** During initial disk shader cache loading and precompilation (`LoadDiskResources`), guest CPU and audio threads are idle; the scheduler dynamically expands active concurrency (e.g., **5 CPU + 1 Driver** on 6C/6T CPUs) to cut initial shader loading time significantly.
+- **Zero-Deadlock Gameplay Transition:** Once boot loading completes, `SetActiveWorkerLimits` lowers concurrency cleanly via `std::condition_variable` without tearing down threads, restoring the conservative gameplay profile (**2 CPU + 1 Driver** on 6C/6T CPUs such as Core i5-9400F, i5-8400, or Ryzen 3500) to prevent thread thrashing and protect guest CPU, audio, and Vulkan submission threads.
+- Scalable dynamic profiles for 4-thread, 6-thread, 8-thread, 12-thread, and 16+ thread CPUs.
 
 ### 2. VIP Shader Queue & Batch Syscalls
 - **4-Tier Priority Hierarchy:** `NeedNow` (blocking) -> `Vip` (essential gameplay) -> `Soon` (effects/particles) -> `Background` (precache).
@@ -83,8 +84,17 @@ An enhanced, high-performance fork of **[zortos293/Lichii](https://github.com/zo
 - **Unified Multi-Core JIT Cache:** Shares a single unified 1 GiB JIT executable code cache across all guest CPU cores on x86-64 multicore, eliminating 72%–74% of redundant physics and AI recompilation during multi-actor scenes (e.g. 12-kart racing packs) and saving 800–900 MiB of system memory.
 - **Lock-Free Fast Paths:** Protected with `std::shared_mutex` for zero-contention simultaneous lookups via `std::shared_lock` across all 6 cores and atomic double-checked block insertion on cache misses.
 
-### 15. In-Memory Telemetry Architecture
-- Moves high-frequency readback and telemetry counters strictly into RAM using atomic operations (`std::atomic<u64>`), eliminating disk I/O and log mutex contention in critical render loops while keeping 10-second periodic diagnostic summaries intact.
+### 15. In-Memory Telemetry Architecture (10s Consolidated Reporting)
+- Replaces high-frequency per-frame and per-readback disk log writes (`PaceToVblank`, `OnCPURead`, `RanFrameAhead`) with lock-free RAM counters using `std::atomic<u64>` (`std::memory_order_relaxed`).
+- Emits a single consolidated `10s Telemetry` summary line every 10 seconds and upon session exit, eliminating log mutex contention and SSD I/O stalls during gameplay without sacrificing diagnostic metrics.
+
+### 16. NVIDIA Global Memory Route Optimization (Credits: Tasarren)
+- Restricts `OpSelect` global memory buffer selection (`SelectsGlobalMemoryBuffer`) strictly to compute shaders and the two specific graphics hashes requiring it (`0xf98012dc9a4465ff`, `0xe78efceda31f97a8`).
+- Restores direct candidate buffer routing in graphics shaders on NVIDIA proprietary drivers, reducing instruction overhead and improving rendering throughput.
+
+### 17. Software Video & AV1 Cutscene Pool (`FFmpeg` / `libdav1d`)
+- Caps software video decoding worker threads based on host CPU topology (`thread_count = 2` on $\le 6$-thread CPUs, with `libdav1d` `framethreads`/`max_frame_delay` tuned to `2` and `tilethreads = 1` when no hardware decoder is active), preventing AV1 cutscenes from saturating guest CPU cores.
+- Expands the decoded frame buffer queue (`MaxDecodedAhead = 5`) in `INx2VideoSession` to absorb software decode jitter and maintain smooth cutscene pacing.
 
 ---
 
@@ -114,7 +124,7 @@ Open **Emulation > Configure** (or `Ctrl+,`):
 This custom optimization fork builds upon the incredible work of the open-source community:
 
 - **[Zortos (zortos293)](https://github.com/zortos293/Lichii):** Creator and main maintainer of Lichii.
-- **[Tasarren](https://github.com/tasarren/Lichii):** Author of the VMA dedicated render target/storage pool optimizations and VRAM reduction techniques.
+- **[Tasarren](https://github.com/tasarren/Lichii):** Author of the VMA dedicated render target/storage pool optimizations, shared Dynarmic JIT code cache, NVIDIA global memory route isolation, and VRAM reduction techniques.
 - **Upstream Projects:** Eglantine (Camille LaVey), Eden Emulator Project, yuzu, and Sudachi.
 
 ---

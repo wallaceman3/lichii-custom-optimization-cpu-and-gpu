@@ -1059,6 +1059,7 @@ void GpuSplit::ReportAcquire() {
              "already meets: {} of {}",
              sites.empty() ? "none" : sites, trigger_not_met, trigger_not_met_twice,
              queued_unknown_met, queued_unknown);
+    Tegra::FlushPeriodicTelemetry(std::chrono::steady_clock::now());
     const u64 qmd_valued = take(stats.qmd_valued);
     const u64 qmd_waits = take(stats.qmd_waits);
     const u64 qmd_late = take(stats.qmd_late);

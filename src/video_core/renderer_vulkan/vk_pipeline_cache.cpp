@@ -514,7 +514,8 @@ struct PipelineWorkerCounts {
     size_t driver_workers;
 };
 
-PipelineWorkerCounts GetSmartPipelineWorkers(const Device* device = nullptr) {
+PipelineWorkerCounts GetSmartPipelineWorkers(const Device* device = nullptr,
+                                             [[maybe_unused]] bool boot_turbo = false) {
     const size_t total_threads =
         std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL);
 
@@ -530,7 +531,25 @@ PipelineWorkerCounts GetSmartPipelineWorkers(const Device* device = nullptr) {
     size_t cpu_w = 2;
     size_t driver_w = 1;
 
-    if (total_threads <= 6) {
+    if (boot_turbo) {
+        if (total_threads <= 4) {
+            cpu_w = 3;
+            driver_w = 1;
+        } else if (total_threads <= 6) {
+            // 6c/6t (e.g. i5-9400F) during initial boot load: guest CPU and audio are idle.
+            cpu_w = 5;
+            driver_w = 1;
+        } else if (total_threads <= 8) {
+            cpu_w = 6;
+            driver_w = 2;
+        } else if (total_threads <= 12) {
+            cpu_w = 10;
+            driver_w = 2;
+        } else {
+            cpu_w = std::min<size_t>(total_threads - 2ULL, 14ULL);
+            driver_w = total_threads >= 16 ? 3ULL : 2ULL;
+        }
+    } else if (total_threads <= 6) {
         // 6c/6t (e.g. i5-9400F, i5-8400, Ryzen 3500) or 4c/4t:
         // Reserve at least 3-4 cores for guest CPU, GPU thread, and audio to avoid stuttering.
         cpu_w = 2;
@@ -891,12 +910,14 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     dynamic_features.has_provoking_vertex_tf_preserve =
         device.SupportsTransformFeedbackProvokingVertexPreservation();
 
-    const auto worker_counts = GetSmartPipelineWorkers(&device);
+    const auto boot_workers = GetSmartPipelineWorkers(&device, true);
+    const auto gameplay_workers = GetSmartPipelineWorkers(&device, false);
     shader_jobs.emplace(VideoCommon::ShaderJobConfig{
-        .cpu_threads = worker_counts.cpu_workers,
-        .driver_threads = worker_counts.driver_workers,
+        .cpu_threads = std::max(boot_workers.cpu_workers, gameplay_workers.cpu_workers),
+        .driver_threads = std::max(boot_workers.driver_workers, gameplay_workers.driver_workers),
         .name = "VkShader",
     });
+    shader_jobs->SetActiveWorkerLimits(gameplay_workers.cpu_workers, gameplay_workers.driver_workers);
 }
 
 namespace {
@@ -1266,6 +1287,18 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
         return;
     }
+    const auto boot_workers = GetSmartPipelineWorkers(&device, true);
+    const auto gameplay_workers = GetSmartPipelineWorkers(&device, false);
+    shader_jobs->SetActiveWorkerLimits(boot_workers.cpu_workers, boot_workers.driver_workers);
+    LOG_INFO(Render_Vulkan, "Shader worker turbo mode active for boot: {} CPU + {} Driver workers",
+             boot_workers.cpu_workers, boot_workers.driver_workers);
+    SCOPE_EXIT {
+        shader_jobs->SetActiveWorkerLimits(gameplay_workers.cpu_workers,
+                                           gameplay_workers.driver_workers);
+        LOG_INFO(Render_Vulkan,
+                 "Shader worker gameplay mode restored: {} CPU + {} Driver workers",
+                 gameplay_workers.cpu_workers, gameplay_workers.driver_workers);
+    };
     namespace CacheV2 = VideoCommon::ShaderCacheV2;
     pipeline_cache_filename = base_dir / CacheV2::FileName;
     // Left by a boot load that never finished (a driver crash, abort or hang): this boot builds
@@ -3222,7 +3255,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (defer_emission) {
             deferred_runtime_infos[stage_index] = runtime_info;
             if (VideoCommon::Nx2Perf::Verify()) {
-                reference_spirv[stage_index] = EmitSPIRV(profile, runtime_info, program, binding);
+                reference_spirv[stage_index] = EmitPipelineShader(
+                    profile, runtime_info, program, binding, key.unique_hashes[index]);
             }
         } else {
             const auto begin = std::chrono::steady_clock::now();
