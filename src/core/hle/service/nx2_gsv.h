@@ -2106,11 +2106,14 @@ private:
         constexpr u64 DonkeyKongBananzaProgramId = 0x040074A01BF12000ULL;
         // Ocarina waited ~12 ms a frame on its previous frame's fence here (#161).
         constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
+        // Mario Kart World prepares next frame concurrently to eliminate presentation fence stalls
+        constexpr u64 MarioKartWorldProgramId = 0x0400C3F00006E000ULL;
         int frames_ahead = frames_ahead_setting;
         const u64 app_program_id = system.GetApplicationProcessProgramID();
         if (frames_ahead == -1 && app_program_id == DonkeyKongBananzaProgramId) {
             frames_ahead = 0;
-        } else if (frames_ahead == -1 && app_program_id == OcarinaOfTimeProgramId) {
+        } else if (frames_ahead == -1 && (app_program_id == OcarinaOfTimeProgramId ||
+                                          app_program_id == MarioKartWorldProgramId)) {
             frames_ahead = 1;
         }
         const auto entered = std::chrono::steady_clock::now();

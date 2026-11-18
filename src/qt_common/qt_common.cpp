@@ -268,6 +268,16 @@ void Init(QWidget* root) {
     if (std::optional<int> processor_core = Common::GetProcessorCount()) {
         LOG_INFO(Frontend, "Host CPU Cores: {}", *processor_core);
     }
+    const bool avx2_setting_enabled = Settings::values.cpuopt_intel_avx2.GetValue();
+    if (caps.avx2) {
+        if (avx2_setting_enabled) {
+            LOG_INFO(Frontend, "Host CPU AVX2 Compatibility: Supported (Hardware AVX2 detected, Optimization Active)");
+        } else {
+            LOG_INFO(Frontend, "Host CPU AVX2 Compatibility: Supported (Disabled by User via Settings)");
+        }
+    } else {
+        LOG_WARNING(Frontend, "Host CPU AVX2 Compatibility: Unsupported (Host CPU lacks AVX2 instruction set, Falling back to SSE4.1/AVX)");
+    }
 #endif
     LOG_INFO(Frontend, "Host CPU Threads: {}", processor_count);
     LOG_INFO(Frontend, "Host OS: {}", PrettyProductName().toStdString());
