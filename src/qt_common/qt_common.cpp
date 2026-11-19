@@ -18,6 +18,7 @@
 #endif
 #include "common/scm_rev.h"
 #include "common/cpu_features.h"
+#include "common/settings.h"
 #include "core/memory.h"
 
 #include <QGuiApplication>
