@@ -481,7 +481,6 @@ constexpr std::array BUILTIN_PATCHES{
         .records = FPS_UNLOCK_RECORDS,
         .states = FPS_UNLOCK_STATES,
         .replaces = "Dynamic FPS by Dark (built-in)",
-        .unlocks_frame_rate = true,
     },
     BuiltinPatch{
         .name = "Dynamic FPS by Dark (built-in)",
@@ -490,7 +489,6 @@ constexpr std::array BUILTIN_PATCHES{
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
         .records = DYNAMIC_FPS_RECORDS,
         .states = DYNAMIC_FPS_STATES,
-        .unlocks_frame_rate = true,
     },
     // The NVIDIA DLSS quality lowers Ocarina's render resolution under Max Resolution, since DLSS
     // replaces the game's own 1440p -> 4K upscale and takes whatever the game renders.

@@ -70,7 +70,6 @@ TEST_CASE("A native draw needs history on every render target it writes, through
     REQUIRE_FALSE(Vulkan::ColorWritesHaveHistory(2, identity, none, writes_all));
     REQUIRE_FALSE(Vulkan::ColorWritesHaveHistory(0, identity, writes_all, writes_all));
 }
-
 TEST_CASE("Transient 2D particle draws with history can discard; font atlases wait",
           "[video_core][async_draw]") {
     // Star Fox font atlas (30-672 vertices, single instance): never discarded even with history.

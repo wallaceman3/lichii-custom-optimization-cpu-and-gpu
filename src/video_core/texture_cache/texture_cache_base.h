@@ -775,12 +775,14 @@ private:
     void NoteFlushed(const ImageBase& image, u64 tick);
     /// Fills `keep` with the bytes of the image's guest memory that landed write-backs and
     /// flushes with contents newer than `tick` hold (an asynchronous flush's snapshot leaves them).
-    void KeepNewerLanded(const ImageBase& image, u64 tick, KeepRanges& keep);
+    /// Not those of `queued` write-backs, which have yet to land.
+    void KeepNewerLanded(const ImageBase& image, u64 tick, KeepRanges& keep,
+                         std::span<const WritebackRanges::TickedRange> queued = {});
     /// Whether the collector's or joins' write-backs are on (writeback_switches.h).
     [[nodiscard]] static bool OverlapWritebacksEnabled();
     u64 join_writeback_reuses{};
     void WriteBackBadOverlaps(ImageId new_image_id);
-    /// Collector write-backs waiting for the GPU (EDEN_NX2_GC_DOWNLOAD_ASYNC): written to guest
+    /// Collector write-backs waiting for the GPU: written to guest
     /// memory once their command buffer is done, except bytes the guest writes first; dropped if
     /// the memory is unmapped first. Their pages stay write-tracked meanwhile.
     struct AsyncOverlapDownload {
@@ -829,7 +831,7 @@ private:
     std::unordered_map<DAddr, u64> overlap_writeback_ticks;
     /// The same write-backs by byte range, per page they touch (a few each, CapPageRecords):
     /// small targets share pages, and a page-wide skip dropped a neighbour's data with them
-    /// (black UI boxes, EDEN_NX2_GC_DOWNLOAD_KEEP_BYTES).
+    /// (black UI boxes).
     struct WritebackRange {
         DAddr begin;
         DAddr end;

@@ -44,7 +44,6 @@ constexpr bool CanDiscardTransient2DDraw(bool native, bool has_color_history, bo
     }
     return element_count > 1024 || instance_count > 1;
 }
-
 /// Whether a draw writes color, and only into render targets first written in an earlier frame,
 /// so skipping it leaves last frame's image rather than an unwritten one (Eglantine #874).
 /// @param count       Color outputs of the draw (rt_control.count).
