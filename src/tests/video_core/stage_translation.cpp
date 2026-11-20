@@ -454,7 +454,7 @@ TEST_CASE("Compute SPIR-V emitted by a job matches the GPU thread's", "[stage_tr
     CHECK(compute_fixtures > 0);
 }
 
-TEST_CASE("Texture descriptor pools up to 4 MiB are flushed for translation on workers",
+TEST_CASE("Texture descriptor pools up to 8 MiB are flushed for translation on workers",
           "[stage_translation]") {
     using VideoCommon::CanFlushTexturePool;
     using VideoCommon::MaxFlushedTexturePoolBytes;
@@ -470,8 +470,12 @@ TEST_CASE("Texture descriptor pools up to 4 MiB are flushed for translation on w
     CHECK(TexturePoolBytes(33067) == 1'058'176);
     CHECK(CanFlushTexturePool(33067));
 
-    // The cap is 4 MiB, it is inclusive, and the largest limit does not overflow
-    CHECK(MaxFlushedTexturePoolBytes == (u64{4} << 20));
+    // Mario Kart World's pool of 131,372 descriptors (4,203,904 bytes), just over 4 MiB
+    CHECK(TexturePoolBytes(131371) == 4'203'904);
+    CHECK(CanFlushTexturePool(131371));
+
+    // The cap is 8 MiB, it is inclusive, and the largest limit does not overflow
+    CHECK(MaxFlushedTexturePoolBytes == (u64{8} << 20));
     constexpr u32 last_index = static_cast<u32>(MaxFlushedTexturePoolBytes / 32 - 1);
     CHECK(TexturePoolBytes(last_index) == MaxFlushedTexturePoolBytes);
     CHECK(CanFlushTexturePool(last_index));
