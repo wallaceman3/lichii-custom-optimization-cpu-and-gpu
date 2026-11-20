@@ -109,6 +109,8 @@ public:
 
     u64 GetDeviceHeapMemoryBudget() const;
 
+    u64 GetDeviceLocalHeapSize() const;
+
     [[nodiscard]] bool IsIntegrated() const noexcept;
 
     u64 GetDeviceMemorySlack() const;

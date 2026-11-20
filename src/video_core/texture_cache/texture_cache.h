@@ -207,16 +207,40 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
     u64 ticks_to_destroy = 0;
     size_t num_iterations = 0;
     const auto Configure = [&](bool allow_aggressive) {
-        u64 budget = 0;
-        if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
-            budget = runtime.GetDeviceMemoryBudget();
-        }
-        const double usage_pct = budget > 0 ? (static_cast<double>(total_used_memory) / static_cast<double>(budget)) : 0.0;
+        const u64 total_gpu_vram = [&]() {
+            if constexpr (requires { runtime.IsIntegrated(); }) {
+                if (runtime.IsIntegrated()) {
+                    if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+                        return runtime.GetDeviceMemoryBudget();
+                    }
+                }
+            }
+            if constexpr (requires { runtime.GetDeviceLocalHeapSize(); }) {
+                const u64 heap_size = runtime.GetDeviceLocalHeapSize();
+                if (heap_size > 0) {
+                    return heap_size;
+                }
+            }
+            if constexpr (requires { runtime.GetDeviceLocalMemory(); }) {
+                const u64 local_mem = runtime.GetDeviceLocalMemory();
+                if (local_mem > 0) {
+                    return local_mem;
+                }
+            }
+            if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+                return runtime.GetDeviceMemoryBudget();
+            }
+            return 0ULL;
+        }();
 
-        // Emergency trigger: usage above 85% of budget, out of memory, or exceeding critical threshold
+        const double usage_pct = total_gpu_vram > 0
+            ? (static_cast<double>(total_used_memory) / static_cast<double>(total_gpu_vram))
+            : 0.0;
+
+        // Emergency trigger: usage above 85% of total GPU VRAM, out of memory, or exceeding critical threshold
         const bool emergency_mode = out_of_memory || usage_pct >= 0.85 ||
                                     (critical_memory > 0 && total_used_memory >= critical_memory);
-        // High priority: usage above 75% or exceeding expected threshold
+        // High priority: usage above 75% of total GPU VRAM or exceeding expected threshold
         high_priority_mode = emergency_mode || usage_pct >= 0.75 ||
                              (expected_memory > 0 && total_used_memory >= expected_memory);
         aggressive_mode = allow_aggressive && emergency_mode;
@@ -1242,15 +1266,23 @@ void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // What the device budget allows (budget minus margins), before that cap.
     const u64 budget_critical = critical_memory;
     const u64 budget_expected = expected_memory;
-    u64 max_critical = MaxCriticalMemory;
-    if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
-        max_critical = (std::max)(max_critical, runtime.GetDeviceMemoryBudget() / 8 * 5);
-    }
+    const u64 max_critical = [&]() {
+        if constexpr (requires { runtime.GetDeviceLocalHeapSize(); }) {
+            const u64 heap_size = runtime.GetDeviceLocalHeapSize();
+            if (heap_size > 0) {
+                return heap_size * 85 / 100;
+            }
+        }
+        if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+            return (std::max)(MaxCriticalMemory, runtime.GetDeviceMemoryBudget() / 8 * 5);
+        }
+        return MaxCriticalMemory;
+    }();
     critical_memory = (std::min)(critical_memory, max_critical);
-    expected_memory =
-        (std::min)(expected_memory, critical_memory - (std::min)(critical_memory, u64{768_MiB}));
-    minimum_memory =
-        (std::min)(minimum_memory, expected_memory - (std::min)(expected_memory, u64{1_GiB}));
+    const u64 spacing = (std::min)(critical_memory / 10, u64{768_MiB});
+    expected_memory = (std::min)(expected_memory, critical_memory - spacing);
+    const u64 min_spacing = (std::min)(expected_memory / 4, u64{1_GiB});
+    minimum_memory = (std::min)(minimum_memory, expected_memory - min_spacing);
     // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB raise the collector's thresholds past
     // MaxCriticalMemory, but never past what the device budget allows: set outright, they kept
     // the cache above a shrinking budget (other programs' video memory, out-of-memory margins) and
@@ -1460,8 +1492,22 @@ void TextureCache<P>::TickFrame() {
             if (native_thresholds_applied && budget_check_frames++ % 30 == 0) {
                 const u64 budget = runtime.GetDeviceMemoryBudget();
                 retention_limit = 0;
-                if (budget > 2_GiB) {
-                    const u64 margin = (std::min)(budget / 8, 1_GiB);
+                if (budget > 1_GiB) {
+                    const u64 total_gpu_vram = [&]() {
+                        if constexpr (requires { runtime.IsIntegrated(); }) {
+                            if (runtime.IsIntegrated()) {
+                                return budget;
+                            }
+                        }
+                        if constexpr (requires { runtime.GetDeviceLocalHeapSize(); }) {
+                            const u64 heap_size = runtime.GetDeviceLocalHeapSize();
+                            if (heap_size > 0) {
+                                return heap_size;
+                            }
+                        }
+                        return budget;
+                    }();
+                    const u64 margin = (std::min)(total_gpu_vram / 10, 1_GiB);
                     if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
                         // The usage counted here leaves out the unused part of the allocator's
                         // blocks, which the driver counts and a full heap cannot hand to a new
@@ -1474,8 +1520,11 @@ void TextureCache<P>::TickFrame() {
                                            ? slack
                                            : slack_margin - (std::min)(slack_margin - slack, 16_MiB);
                     }
-                    const u64 reserved = margin + fit_margin + slack_margin;
-                    critical_memory = budget - (std::min)(reserved, budget / 2);
+                    const u64 reserved = fit_margin + slack_margin;
+                    critical_memory = (total_gpu_vram * 85 / 100) - (std::min)(reserved, total_gpu_vram / 8);
+                    if (budget != 0) {
+                        critical_memory = (std::min)(critical_memory, budget);
+                    }
                     // The device's budget is not all the room there is: see HostCriticalMemory.
                     // The usage is the driver's, which still counts images waiting to be freed.
                     const std::optional<u64> commit_room = Common::GetSystemCommitRoom();
@@ -1488,7 +1537,10 @@ void TextureCache<P>::TickFrame() {
                     const u64 room_margin =
                         (std::min)(fit_margin + slack_margin, retention_budget / 2);
                     retention_limit = (std::min)(retention_budget - room_margin, host_critical);
-                    expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
+                    expected_memory = total_gpu_vram * 75 / 100;
+                    if (expected_memory >= critical_memory) {
+                        expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
+                    }
                     ApplyThresholdOverrides(false);
                     u64 other_memory = 0;
                     if constexpr (requires { runtime.GetDeviceHeapMemoryBudget(); }) {

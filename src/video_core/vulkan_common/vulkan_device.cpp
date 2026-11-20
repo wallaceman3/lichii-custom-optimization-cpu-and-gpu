@@ -2520,31 +2520,23 @@ void Device::CollectPhysicalMemoryInfo() {
     }
     main_heap_size = limit(mem_properties.memoryHeaps[main_heap].size);
     const Settings::VramUsageMode vram_mode = Settings::values.vram_usage_mode.GetValue();
-    const u64 device_budget = device_access_memory;
-    vram_target = VideoCommon::VramTarget(vram_mode, device_budget);
+    const u64 total_gpu_vram = is_integrated ? device_access_memory : main_heap_size;
+    vram_target = VideoCommon::VramTarget(vram_mode, total_gpu_vram);
     if (vram_target != 0) {
-        LOG_INFO(Render_Vulkan, "VRAM usage mode {}: target {} MiB (device budget {} MiB)",
-                 Settings::CanonicalizeEnum(vram_mode), vram_target >> 20, device_budget >> 20);
+        LOG_INFO(Render_Vulkan, "VRAM usage mode {}: target {} MiB (total VRAM {} MiB)",
+                 Settings::CanonicalizeEnum(vram_mode), vram_target >> 20, total_gpu_vram >> 20);
     } else {
-        LOG_INFO(Render_Vulkan, "VRAM usage mode {}: no target (device budget {} MiB)",
-                 Settings::CanonicalizeEnum(vram_mode), device_budget >> 20);
+        LOG_INFO(Render_Vulkan, "VRAM usage mode {}: no target (total VRAM {} MiB)",
+                 Settings::CanonicalizeEnum(vram_mode), total_gpu_vram >> 20);
     }
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
         const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;
         device_access_memory = static_cast<u64>(std::max<s64>(std::min<s64>(available_memory - 8_GiB, memory_size), std::min<s64>(local_memory, memory_size)));
     } else {
-        const u64 reserve_memory = std::min<u64>(device_access_memory / 8, 1_GiB);
-        device_access_memory -= reserve_memory;
-        if (Settings::values.vram_usage_mode.GetValue() != Settings::VramUsageMode::Aggressive) {
-            // Account for resolution scaling in memory limits
-            const size_t normal_memory = 6_GiB;
-            const size_t scaler_memory = 1_GiB * Settings::values.resolution_info.ScaleUp(1);
-            device_access_memory = std::min<u64>(device_access_memory, normal_memory + scaler_memory);
+        if (vram_target != 0) {
+            device_access_memory = (std::min)(device_access_memory, vram_target);
         }
-    }
-    if (vram_target != 0) {
-        device_access_memory = (std::min)(device_access_memory, vram_target);
     }
 }
 

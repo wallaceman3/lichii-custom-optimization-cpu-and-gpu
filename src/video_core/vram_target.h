@@ -8,18 +8,17 @@
 
 namespace VideoCommon {
 
-/// Device memory the emulator aims to stay under for `mode`, given the driver's budget for the
-/// process when the device is created (0 without VK_EXT_memory_budget). 0 means no target: the
-/// caches follow the driver's budget alone. Conservative takes 85% of the DXGI device budget,
-/// leaving the rest to the desktop and other programs (~6.1 GB on an 8 GB card with 7.1 GB budget).
-/// Aggressive removes the soft target cap.
-[[nodiscard]] constexpr u64 VramTarget(Settings::VramUsageMode mode, u64 device_budget) {
+/// Device memory the emulator aims to stay under for `mode`, given the total VRAM of the GPU.
+/// 0 means no target: the caches follow the driver's budget alone (Aggressive mode).
+/// Conservative dynamically targets 85% of total GPU VRAM (~6.95 GB on an 8 GB card,
+/// ~10.4 GB on a 12 GB card, ~13.9 GB on a 16 GB card).
+[[nodiscard]] constexpr u64 VramTarget(Settings::VramUsageMode mode, u64 total_gpu_vram) {
     switch (mode) {
     case Settings::VramUsageMode::Aggressive:
         return 0;
     case Settings::VramUsageMode::Conservative:
     default:
-        return device_budget * 85 / 100;
+        return total_gpu_vram * 85 / 100;
     }
 }
 

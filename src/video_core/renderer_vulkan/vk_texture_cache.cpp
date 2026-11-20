@@ -3080,6 +3080,10 @@ u64 TextureCacheRuntime::GetDeviceHeapMemoryBudget() const {
     return device.GetDeviceHeapMemoryBudget();
 }
 
+u64 TextureCacheRuntime::GetDeviceLocalHeapSize() const {
+    return device.GetDeviceLocalHeapSize();
+}
+
 bool TextureCacheRuntime::IsIntegrated() const noexcept {
     return device.IsIntegrated();
 }

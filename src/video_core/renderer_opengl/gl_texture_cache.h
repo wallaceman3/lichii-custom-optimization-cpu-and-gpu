@@ -90,6 +90,10 @@ public:
         return device_access_memory;
     }
 
+    u64 GetDeviceLocalHeapSize() const {
+        return device_access_memory;
+    }
+
     u64 GetDeviceMemoryUsage() const;
 
     bool CanReportMemoryUsage() const {
