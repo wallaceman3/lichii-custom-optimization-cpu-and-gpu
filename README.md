@@ -49,12 +49,12 @@ An enhanced, high-performance fork of **[zortos293/Lichii](https://github.com/zo
 
 ### 8. VRAM Reduction, 3-Tier GC & Memory Architecture (Credits: Tasarren)
 - **Direct VMA Memory Allocation:** Streamlines image creation directly through Vulkan Memory Allocator to eliminate probe/destruction overhead while preserving 4 MiB buffer blocks.
-- **Dynamic VRAM Target (85% DXGI Budget):** Soft target caps device memory usage to 85% of available budget (~6.1 GB on 8 GB cards), reserving ample head-room for Windows DWM and preventing system commit exhaustion.
+- **Dynamic VRAM Target (85% Total GPU VRAM):** Soft target dynamically scales device memory usage to 85% of total dedicated GPU VRAM (~6.95 GB on 8 GB cards, ~10.4 GB on 12 GB cards, ~13.9 GB on 16 GB cards), reserving ample head-room for Windows DWM and preventing system commit exhaustion.
 - **Discrete GPU Memory Threshold Protection:** Distinguishes integrated GPUs from discrete GPUs so non-texture allocations never inadvertently inflate discrete GPU retention floors up to the physical memory limit.
 - **3-Tier Texture Garbage Collector (Anti-Thrashing):**
-  - **< 75% VRAM:** Relaxed retention (90 frames, ~1.5–3s), preserving textures across corners and turns with zero re-decode thrashing.
-  - **75%–85% VRAM:** Moderate eviction (60 frames, 32 iterations/frame) for steady pruning of stale assets.
-  - **> 85% VRAM (Emergency):** High-throughput eviction (15 frames, 128 iterations/frame) to swiftly reclaim space before driver OOM limits.
+  - **< 75% GPU VRAM:** Relaxed retention (90 frames, ~1.5–3s), preserving textures across corners and turns with zero re-decode thrashing.
+  - **75%–85% GPU VRAM:** Moderate eviction (60 frames, 32 iterations/frame) for steady pruning of stale assets.
+  - **> 85% GPU VRAM (Emergency):** High-throughput eviction (15 frames, 128 iterations/frame) to swiftly reclaim space before driver OOM limits.
 - **Allocation & ShaderCacheWriter Memory Shield:** Protected with `try/catch` exception handlers in `JoinImages` and `CacheWriter` to ensure low-commit spikes or cache write delays never trigger process aborts.
 
 ### 9. Draw Submission Batching (`DefaultNativeBudget = 256`)
@@ -106,6 +106,14 @@ An enhanced, high-performance fork of **[zortos293/Lichii](https://github.com/zo
 ### 20. Memory-Aware Boot Shader Budget & Transient 2D Draw Heuristic
 - **Dynamic Boot Shader Cap (`ComputeDynamicBootPipelineCap`):** Sizes cold-cache boot shader precompilation dynamically from available host RAM and GPU VRAM budget (clamped between 1,024 and 32,768 pipelines) while respecting `KeptPipelines()`.
 - **Transient 2D Effect Heuristic (`CanDiscardTransient2DDraw`):** Allows asynchronous pipeline compilation for large or instanced transient 2D particle/effect draws into existing render targets without depth testing, while keeping persistent font atlas draws (30–672 vertices) strictly synchronous.
+
+### 21. CPU Stutter Elimination & Frame Pacing Engine (Build 1.13)
+- **ZeroTrim Exponential Backoff:** Tracks newly kernel zero-filled memory and trims only after active zero allocations exceed 64 MiB post-boot, backing off up to 300 s with an emergency wake-up when system commit headroom drops below 2 GiB. Eliminates ~29,000 periodic soft page faults and 1.0–1.6s CPU stalls every 11 seconds.
+- **Dual-VSync Elimination for 30 FPS Mode:** Extends the `b.lo` to unconditional branch bypass on `vblank_wait_site` to fixed 30 FPS mode (`mkw_30fps`), establishing `PaceToVblank` (`swap_interval = 2`) as the sole authoritative clock and eliminating the 0.3 ms clock drift that caused 66.6–73.3 ms frame hitches.
+- **8 MiB Stage Translation Texture Pool:** Expands `MaxFlushedTexturePoolBytes` from 4 MiB to 8 MiB, allowing 131,372-descriptor pools (e.g. Mario Kart World's 4.2 MB pool) to translate asynchronously on background shader workers instead of stalling `GPUBack`.
+- **Lock-Free OnCPURead Fast Path:** Guards `texture_cache.mutex` acquisition in `FlushRegion` / `FlushRegionForRead` with `page_filter.Any(addr, size)` and increases `MaxReadBackPages` from 512 to 2048, eliminating mutex contention between guest CPU culling reads and texture submission.
+- **Macro 0x142 DMA Page Cache:** Caches the last clean 4 KiB DMA page in `MacroEngine::Execute`, avoiding hundreds of redundant `FlushPending` / `IsMemoryDirty` lock acquisitions during 24-byte coordinate batch reads.
+- **Abandoned Query Suppression:** Automatically suspends `StartCounter` / `EndCounter` when 4 consecutive 1024-slot batches of `SamplesPassed` queries are dropped without reading, immediately reactivating upon the guest's first `ResetCounter` / `WriteCounter`.
 
 ---
 
