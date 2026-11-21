@@ -4,6 +4,22 @@ See `docs/Coding.md` for technical coding guidance.
 
 Keep comments to a reasonable level. Do not overexplain or add/remove comments from unrelated parts of the codebase.
 
+## Documentation & Release Rules
+
+- **NUNCA enviar ideias de implementações futuras, rascunhos ou roadmaps para o Git:**
+  - Ideias de implementações futuras, planejamentos e rascunhos conceituais devem permanecer **estritamente locais** no PC do usuário, na pasta `D:\Games\YUZU\EMULADOR\SWITCH 2\Lichii-Otimizacoes-e-Patches\`.
+  - O repositório Git DEVE conter apenas código funcional já implementado e documentação de recursos existentes e testados.
+- **NUNCA mencionar IA, assistentes ou ferramentas de automação no Git:**
+  - O repositório Git (incluindo `README.md`, commits, mensagens de PR e código-fonte) NÃO deve conter nenhuma referência a assistentes de IA, skills ou ferramentas automatizadas de agentes. O repositório deve manter a aparência estrita de um desenvolvimento manual padrão C++.
+- **Always update `README.md` on every new upload/release to Git:**
+  - Clearly document all custom CPU and GPU optimizations included in the build.
+  - Maintain complete credits to upstream authors (Zortos) and contributors (Tasarren for VRAM and memory optimizations).
+  - Keep the recommended settings guide accurate and up-to-date.
+- **SEMPRE comparar o log de telemetria com todas as implementações customizadas:**
+  - Em cada nova versão ou análise de sessão, verificar rigorosamente os dados reais do log (`eden_log.txt`: margins de memória/VRAM, host spill, stutters, tempos de JIT e frame pacing).
+  - Confrontar o comportamento do log com cada uma das otimizações implementadas no fork.
+  - Se qualquer implementação customizada apresentar desempenho inferior ao código upstream, causar regressão de FPS, engasgos ou apresentar qualquer problema na aplicação, isso DEVE ser explicitamente reportado e detalhado para avaliação antes de manter ou descartar o código.
+
 ## Game bug reports
 
 Users report game bugs with Lichii logs (`eden_log.txt`, `eden_log.txt.old`). Each `Booting game: <program id>` line starts a session; the build is on the first line (`Lichii Version: ... | nx2-<sha>`). Known program ids:

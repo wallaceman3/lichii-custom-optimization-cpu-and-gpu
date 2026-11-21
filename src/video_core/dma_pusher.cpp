@@ -580,14 +580,18 @@ bool DmaPusher::Step() {
         const bool safe_reads =
             Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe();
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() && safe_reads;
+        const bool has_snapshot = (command_list.snapshot_suspensions & 1) == 0 &&
+                                  command_list.snapshot_suspensions ==
+                                      suspensions.load(std::memory_order_acquire) &&
+                                  command_resume_offset == 0 &&
+                                  dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
+                                  !std::ranges::binary_search(command_list.deferred_entries,
+                                                              static_cast<u32>(dma_pushbuffer_subindex));
         // Pages no GPU work has written yet may still get the list from compute or copy work
-        // queued before it. The GPU fetches the list after that work only past a host-level wait
-        // (NoteSync): later work is not ordered before the fetch, and the list does not wait for
-        // it (nor for draws, which write memory too; draw-written lists wait for the last sync).
-        // Safe reads wait for all of the work before that wait, draws included: a queued draw may
-        // write the list's page for the first time.
+        // queued before it. When a valid submit-time snapshot is already available in host memory
+        // and the page is not GPU-written, we can bypass synchronous writer waiting.
         if (auto& split = VideoCommon::GpuSplit::Get();
-            split.Active() && (safe_reads || !gpu_written)) {
+            split.Active() && (safe_reads || (!gpu_written && !has_snapshot))) {
             if (safe_reads) {
                 split.WaitForSync();
             } else {
@@ -597,14 +601,10 @@ bool DmaPusher::Step() {
                 IsGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         }
         // Resume and GPU-written entries need live words, even after a flush cleared dirty state.
-        bool submitted = (command_list.snapshot_suspensions & 1) == 0 &&
-                         command_list.snapshot_suspensions ==
-                             suspensions.load(std::memory_order_acquire) &&
+        bool submitted = has_snapshot &&
                          VideoCommon::CanUseSubmittedCommands(
             command_resume_offset != 0,
-            dma_pushbuffer_subindex < command_list.submitted_offsets.size() &&
-                !std::ranges::binary_search(command_list.deferred_entries,
-                                            static_cast<u32>(dma_pushbuffer_subindex)),
+            has_snapshot,
             gpu_written,
             use_safe && memory_manager.IsMemoryDirty(dma_state.dma_get,
                                                      header.size * sizeof(u32)));

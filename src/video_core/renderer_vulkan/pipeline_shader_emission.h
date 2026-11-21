@@ -11,6 +11,16 @@
 
 namespace Vulkan {
 
+/// Whether a shader routes global memory with OpSelect over every bound buffer on NVIDIA (#1848).
+/// Compute keeps it: the two Ocarina programs of #619 hang the Linux driver (Xid 109) with
+/// candidate-route chains, and NVIDIA compiles other compute programs ~1.6x faster with it, which
+/// shortens first-use freezes. Graphics shaders keep the candidate routes of #1807: the select form
+/// costs ~10 fps at the Market fountain.
+inline bool SelectsGlobalMemoryBuffer(const Shader::IR::Program& program, u64 shader_hash) {
+    return program.stage == Shader::Stage::Compute || shader_hash == 0xf98012dc9a4465ffULL ||
+           shader_hash == 0xe78efceda31f97a8ULL;
+}
+
 inline std::vector<u32> EmitPipelineShader(const Shader::Profile& profile,
                                            const Shader::RuntimeInfo& runtime_info,
                                            Shader::IR::Program& program,
@@ -25,6 +35,7 @@ inline std::vector<u32> EmitPipelineShader(const Shader::Profile& profile,
         routed_profile = profile;
         routed_profile.route_single_candidates = true;
         used = &routed_profile;
+    }
     }
     std::vector<u32> code{
         Shader::Backend::SPIRV::EmitSPIRV(*used, runtime_info, program, binding)};

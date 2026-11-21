@@ -67,6 +67,7 @@ private:
         u32 log2_level;
         u64 index;
         u64 tick = 0;
+        u64 last_used_frame = 0;
 
         StagingBufferRef Ref() const noexcept {
             return {
@@ -137,6 +138,7 @@ private:
     StagingBuffersCache download_cache;
 
     size_t current_delete_level = 0;
+    u64 frame_counter = 0;
     u64 buffer_index = 0;
     u64 unique_ids{};
 };

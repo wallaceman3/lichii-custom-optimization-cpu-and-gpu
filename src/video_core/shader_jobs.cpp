@@ -153,7 +153,9 @@ u64 DefaultShaderJobBudget() {
 
 ShaderJobScheduler::ShaderJobScheduler(const ShaderJobConfig& config)
     : budget{config.memory_budget != 0 ? config.memory_budget : DefaultShaderJobBudget()},
-      background_aging{config.background_aging} {
+      background_aging{config.background_aging},
+      active_cpu_limit{std::max<size_t>(config.cpu_threads, 1)},
+      active_driver_limit{std::max<size_t>(config.driver_threads, 1)} {
     stats.budget_bytes = budget;
     const auto start{[this](std::string name, bool driver) {
         threads.emplace_back([this, name = std::move(name), driver] {
@@ -163,11 +165,31 @@ ShaderJobScheduler::ShaderJobScheduler(const ShaderJobConfig& config)
             Worker(driver);
         });
     }};
-    for (size_t i = 0; i < std::max<size_t>(config.cpu_threads, 1); ++i) {
+    for (size_t i = 0; i < active_cpu_limit; ++i) {
         start(config.name + "Cpu", false);
     }
-    for (size_t i = 0; i < std::max<size_t>(config.driver_threads, 1); ++i) {
+    for (size_t i = 0; i < active_driver_limit; ++i) {
         start(config.name + "Driver", true);
+    }
+}
+
+void ShaderJobScheduler::SetActiveWorkerLimits(size_t cpu_threads, size_t driver_threads) {
+    bool wake_cpu = false;
+    bool wake_driver = false;
+    {
+        std::scoped_lock lock{mutex};
+        const size_t new_cpu = std::max<size_t>(cpu_threads, 1);
+        const size_t new_driver = std::max<size_t>(driver_threads, 1);
+        wake_cpu = new_cpu > active_cpu_limit;
+        wake_driver = new_driver > active_driver_limit;
+        active_cpu_limit = new_cpu;
+        active_driver_limit = new_driver;
+    }
+    if (wake_cpu) {
+        cpu_condition.notify_all();
+    }
+    if (wake_driver) {
+        driver_condition.notify_all();
     }
 }
 
@@ -184,6 +206,7 @@ ShaderJobHandle ShaderJobScheduler::Submit(ShaderJob job, const ShaderJobBatch* 
     state->submitted = Clock::now();
     const bool driver{!state->work.cpu};
     std::vector<ShaderJob> dead;
+    bool notify = false;
     {
         std::scoped_lock lock{mutex};
         if (state->batch) {
@@ -197,9 +220,115 @@ ShaderJobHandle ShaderJobScheduler::Submit(ShaderJob job, const ShaderJobBatch* 
         }
         state->status = driver ? ShaderJobStatus::DriverQueued : ShaderJobStatus::Queued;
         (driver ? driver_queue : cpu_queue)[Index(state->work.priority)].push_back(state);
+
+        if (batch_nesting > 0) {
+            if (driver) {
+                batch_notify_driver = true;
+            } else {
+                batch_notify_cpu = true;
+            }
+        } else {
+            notify = true;
+        }
     }
-    (driver ? driver_condition : cpu_condition).notify_one();
+    if (notify) {
+        (driver ? driver_condition : cpu_condition).notify_one();
+    }
     return ShaderJobHandle{std::move(state)};
+}
+
+std::vector<ShaderJobHandle> ShaderJobScheduler::Submit(std::span<ShaderJob> jobs,
+                                                        const ShaderJobBatch* batch) {
+    if (jobs.empty()) {
+        return {};
+    }
+    std::vector<ShaderJobHandle> handles;
+    handles.reserve(jobs.size());
+    const auto now = Clock::now();
+    bool wake_cpu = false;
+    bool wake_driver = false;
+    std::vector<ShaderJob> dead;
+
+    {
+        std::scoped_lock lock{mutex};
+        if (batch && batch->state) {
+            std::scoped_lock batch_lock{batch->state->mutex};
+            batch->state->pending += jobs.size();
+        }
+        for (auto& job : jobs) {
+            auto state{std::make_shared<ShaderJobState>()};
+            state->priority = job.priority;
+            state->queued_priority = job.priority;
+            state->batch = batch ? batch->state : nullptr;
+            state->submitted = now;
+            const bool driver{!job.cpu};
+            state->work = std::move(job);
+
+            ++stats.priorities[Index(state->work.priority)].queued;
+            if (stopping || StopRequested(*state)) {
+                Finish(*state, ShaderJobStatus::Cancelled, dead);
+                handles.push_back(ShaderJobHandle{std::move(state)});
+                continue;
+            }
+            state->status = driver ? ShaderJobStatus::DriverQueued : ShaderJobStatus::Queued;
+            (driver ? driver_queue : cpu_queue)[Index(state->work.priority)].push_back(state);
+
+            if (batch_nesting > 0) {
+                if (driver) {
+                    batch_notify_driver = true;
+                } else {
+                    batch_notify_cpu = true;
+                }
+            } else {
+                if (driver) {
+                    wake_driver = true;
+                } else {
+                    wake_cpu = true;
+                }
+            }
+            handles.push_back(ShaderJobHandle{std::move(state)});
+        }
+    }
+
+    if (wake_cpu) {
+        if (jobs.size() > 1) {
+            cpu_condition.notify_all();
+        } else {
+            cpu_condition.notify_one();
+        }
+    }
+    if (wake_driver) {
+        if (jobs.size() > 1) {
+            driver_condition.notify_all();
+        } else {
+            driver_condition.notify_one();
+        }
+    }
+
+    return handles;
+}
+
+void ShaderJobScheduler::EnterBatch() {
+    std::scoped_lock lock{mutex};
+    ++batch_nesting;
+}
+
+void ShaderJobScheduler::LeaveBatch() {
+    bool notify_cpu = false;
+    bool notify_driver = false;
+    {
+        std::scoped_lock lock{mutex};
+        if (batch_nesting > 0 && --batch_nesting == 0) {
+            notify_cpu = std::exchange(batch_notify_cpu, false);
+            notify_driver = std::exchange(batch_notify_driver, false);
+        }
+    }
+    if (notify_cpu) {
+        cpu_condition.notify_all();
+    }
+    if (notify_driver) {
+        driver_condition.notify_all();
+    }
 }
 
 ShaderJobBatch ShaderJobScheduler::CreateBatch() {
@@ -335,14 +464,24 @@ ShaderJobStats ShaderJobScheduler::Stats() const {
 
 void ShaderJobScheduler::Worker(bool driver) {
     std::unique_lock lock{mutex};
+    size_t& running = driver ? active_driver_running : active_cpu_running;
+    const size_t& limit = driver ? active_driver_limit : active_cpu_limit;
     while (true) {
         JobPtr job;
         (driver ? driver_condition : cpu_condition).wait(lock, [&] {
-            return stopping || (job = Pick(driver, Clock::now()));
+            if (stopping) {
+                return true;
+            }
+            if (running >= limit) {
+                return false;
+            }
+            job = Pick(driver, Clock::now());
+            return static_cast<bool>(job);
         });
         if (!job) {
             return;
         }
+        ++running;
         StartStage(*job, driver, Clock::now());
         lock.unlock();
         if (driver) {
@@ -352,6 +491,7 @@ void ShaderJobScheduler::Worker(bool driver) {
         }
         job.reset();
         lock.lock();
+        --running;
     }
 }
 
@@ -370,14 +510,20 @@ ShaderJobScheduler::JobPtr ShaderJobScheduler::Pick(bool driver, Clock::time_poi
     bool aged{aged_last};
     std::deque<JobPtr>* entries{front(ShaderJobPriority::NeedNow)};
     if (!entries) {
-        std::deque<JobPtr>* const soon{front(ShaderJobPriority::Soon)};
-        std::deque<JobPtr>* const background{front(ShaderJobPriority::Background)};
-        // An aged Background job ahead of the Soon jobs takes every other pick, so a backlog
-        // doesn't hold back the Soon jobs submitted after it.
-        aged = background && soon && !aged_last &&
-               now - background->front()->submitted >= background_aging &&
-               background->front()->submitted < soon->front()->submitted;
-        entries = aged ? background : (soon ? soon : background);
+        std::deque<JobPtr>* const vip{front(ShaderJobPriority::Vip)};
+        if (vip) {
+            entries = vip;
+            aged = false;
+        } else {
+            std::deque<JobPtr>* const soon{front(ShaderJobPriority::Soon)};
+            std::deque<JobPtr>* const background{front(ShaderJobPriority::Background)};
+            // An aged Background job ahead of the Soon jobs takes every other pick, so a backlog
+            // doesn't hold back the Soon jobs submitted after it.
+            aged = background && soon && !aged_last &&
+                   now - background->front()->submitted >= background_aging &&
+                   background->front()->submitted < soon->front()->submitted;
+            entries = aged ? background : (soon ? soon : background);
+        }
     }
     if (!entries) {
         return nullptr;
@@ -538,17 +684,21 @@ void ShaderJobScheduler::Finish(ShaderJobState& job, ShaderJobStatus status,
 
 void ParallelFor(ShaderJobScheduler& scheduler, size_t count,
                  const std::function<void(size_t)>& function) {
-    std::vector<ShaderJobHandle> handles;
-    handles.reserve(count);
+    if (count == 0) {
+        return;
+    }
+    std::vector<ShaderJob> jobs;
+    jobs.reserve(count);
     for (size_t index = 0; index < count; ++index) {
-        handles.push_back(scheduler.Submit({
+        jobs.push_back({
             .priority = ShaderJobPriority::NeedNow,
             .cpu = [&function, index](ShaderJobContext&) {
                 function(index);
                 return ShaderDriverStage{};
             },
-        }));
+        });
     }
+    std::vector<ShaderJobHandle> handles = scheduler.Submit(jobs);
     // Workers take NeedNow jobs oldest first, so the calling thread runs from the newest: it waits
     // only for calls already running.
     for (auto it = handles.rbegin(); it != handles.rend(); ++it) {

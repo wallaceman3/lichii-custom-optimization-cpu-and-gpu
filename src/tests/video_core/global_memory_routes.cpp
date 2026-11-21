@@ -212,6 +212,29 @@ TEST_CASE("Selecting the buffer routes every access among all bound buffers",
     CHECK(routed == 9);
 }
 
+TEST_CASE("On NVIDIA compute programs select the buffer; graphics keep their routes",
+          "[shader][global_memory_routes]") {
+    Profile profile{};
+    profile.supported_spirv = 0x00010300;
+    profile.support_int64 = true;
+    profile.support_descriptor_aliasing = true;
+    profile.unified_descriptor_binding = true;
+    profile.min_ssbo_alignment = 16;
+    const auto functions = [&](u64 hash, Stage stage = Stage::Compute) {
+        Fixture fixture;
+        fixture.program.stage = stage;
+        Backend::Bindings binding;
+        return SelectionsPerFunction(
+                   Vulkan::EmitPipelineShader(profile, {}, fixture.program, binding, hash))
+            .size();
+    };
+    const size_t routed{functions(0x1234)};
+    profile.select_global_memory_buffer = true;
+    CHECK(functions(0x1234) == 8);
+    CHECK(functions(0x1234, Stage::VertexB) == routed);
+    CHECK(functions(0xf98012dc9a4465ffULL, Stage::VertexB) == 8);
+    CHECK(routed == 9);
+}
 TEST_CASE("Selecting the buffer searches the bound buffers in one function that is not inlined",
           "[shader][global_memory_routes]") {
     Fixture fixture;
@@ -298,7 +321,6 @@ TEST_CASE("Task and mesh programs search the bound buffers inline",
     Dump(code, stage == Stage::Task ? "select_task" : "select_mesh");
     CHECK(NotInlinedCallers(code).empty());
 }
-
 TEST_CASE("A route through a pointer array keeps the bound slots past those searched",
           "[shader][global_memory_routes]") {
     ObjectPool<IR::Inst> pool;

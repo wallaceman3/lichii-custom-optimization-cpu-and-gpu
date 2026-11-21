@@ -509,20 +509,82 @@ struct DeferredStages {
     std::array<std::vector<u32>, Maxwell::MaxShaderStage> reference_spirv;
 };
 
-size_t GetTotalPipelineWorkers() {
-    const size_t max_core_threads =
-        std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
+struct PipelineWorkerCounts {
+    size_t cpu_workers;
+    size_t driver_workers;
+};
+
+PipelineWorkerCounts GetSmartPipelineWorkers(const Device* device = nullptr,
+                                             [[maybe_unused]] bool boot_turbo = false) {
+    const size_t total_threads =
+        std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL);
+
 #ifdef __ANDROID__
     const int configured = AndroidSettings::values.pipeline_worker_count.GetValue();
     const int clamped = std::clamp(configured, 2, 8);
     const size_t desired = static_cast<size_t>(clamped);
-    if (desired == 0) {
-        return 1ULL;
-    }
-    return std::min(max_core_threads, desired);
+    const size_t max_core_threads = total_threads - 1ULL;
+    const size_t cpu_w = desired == 0 ? 1ULL : std::min(max_core_threads, desired);
+    const size_t driver_w = std::min<size_t>(cpu_w, 2ULL);
+    return {cpu_w, driver_w};
 #else
-    return max_core_threads;
+    size_t cpu_w = 2;
+    size_t driver_w = 1;
+
+    if (boot_turbo) {
+        if (total_threads <= 4) {
+            cpu_w = 3;
+            driver_w = 1;
+        } else if (total_threads <= 6) {
+            // 6c/6t (e.g. i5-9400F) during initial boot load: guest CPU and audio are idle.
+            cpu_w = 5;
+            driver_w = 1;
+        } else if (total_threads <= 8) {
+            cpu_w = 6;
+            driver_w = 2;
+        } else if (total_threads <= 12) {
+            cpu_w = 10;
+            driver_w = 2;
+        } else {
+            cpu_w = std::min<size_t>(total_threads - 2ULL, 14ULL);
+            driver_w = total_threads >= 16 ? 3ULL : 2ULL;
+        }
+    } else if (total_threads <= 6) {
+        // 6c/6t (e.g. i5-9400F, i5-8400, Ryzen 3500) or 4c/4t:
+        // Reserve at least 3-4 cores for guest CPU, GPU thread, and audio to avoid stuttering.
+        cpu_w = 2;
+        driver_w = 1;
+    } else if (total_threads <= 8) {
+        // 8c/8t or 4c/8t:
+        cpu_w = 3;
+        driver_w = 1;
+    } else if (total_threads <= 12) {
+        // 6c/12t (e.g. Ryzen 5600, i5-10400, i5-12400):
+        cpu_w = 3;
+        driver_w = 2;
+    } else {
+        // 8c/16t or higher (Ryzen 7/9, i7/i9):
+        cpu_w = std::min<size_t>(total_threads / 2, 6ULL);
+        driver_w = std::min<size_t>(total_threads / 4, 3ULL);
+    }
+
+    if (device) {
+        // NVIDIA proprietary driver already serializes driver compilation internally in vkCreateGraphicsPipelines.
+        // On 6-8 thread CPUs, keep 1 driver worker to avoid thread contention and lock bouncing.
+        if (device->GetDriverID() == VK_DRIVER_ID_NVIDIA_PROPRIETARY && total_threads <= 8) {
+            driver_w = 1;
+        }
+        if (device->HasBrokenParallelShaderCompiling()) {
+            driver_w = 1;
+        }
+    }
+
+    return {cpu_w, driver_w};
 #endif
+}
+
+size_t GetTotalPipelineWorkers(const Device* device = nullptr) {
+    return GetSmartPipelineWorkers(device).cpu_workers;
 }
 
 } // Anonymous namespace
@@ -851,17 +913,16 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     dynamic_features.has_provoking_vertex_tf_preserve =
         device.SupportsTransformFeedbackProvokingVertexPreservation();
 
-    const size_t cpu_threads = GetTotalPipelineWorkers();
-    const size_t driver_threads =
-        device.HasBrokenParallelShaderCompiling()
-            ? 1
-            : std::min(cpu_threads, std::max<size_t>(std::thread::hardware_concurrency() / 2, 2));
+    const auto boot_workers = GetSmartPipelineWorkers(&device, true);
+    const auto gameplay_workers = GetSmartPipelineWorkers(&device, false);
     shader_jobs.emplace(VideoCommon::ShaderJobConfig{
-        .cpu_threads = cpu_threads,
-        .driver_threads = device.IsAmdLegacyGcn() ? std::min<size_t>(driver_threads, 2)
-                                                  : driver_threads,
+        .cpu_threads = std::max(boot_workers.cpu_workers, gameplay_workers.cpu_workers),
+        .driver_threads = device.IsAmdLegacyGcn()
+                              ? std::min<size_t>(std::max(boot_workers.driver_workers, gameplay_workers.driver_workers), 2)
+                              : std::max(boot_workers.driver_workers, gameplay_workers.driver_workers),
         .name = "VkShader",
     });
+    shader_jobs->SetActiveWorkerLimits(gameplay_workers.cpu_workers, gameplay_workers.driver_workers);
 }
 
 namespace {
@@ -892,11 +953,22 @@ u8 MaxUsedPipelineAge(const Device& device) {
 }
 
 // Without a list of the pipelines recent sessions used (the first boot with this cache, or a session
-// that ended before saving it), this many cached graphics pipelines at most are built at boot and the
-// rest when first needed. A cache that grew over many builds held 48k pipelines, ~21 GB of driver
-// memory built before the game started; the list is only saved at exit or after two minutes, so a
-// boot that ran out of memory never saved one and the next boot did the same.
-constexpr size_t MaxPipelinesWithoutUsedList = 3000;
+// that ended before saving it), size the boot precompilation budget dynamically from host RAM and
+// GPU VRAM after reserving OS and guest base memory.
+size_t ComputeDynamicBootPipelineCap(const Device& device) {
+    using namespace Common::Literals;
+    const u64 total_ram = Common::GetMemInfo().TotalPhysicalMemory;
+    const u64 vram_budget = device.GetDeviceMemoryBudget();
+    const u64 ram_reserve = total_ram >= 12_GiB ? 6_GiB : 3_GiB;
+    const u64 free_ram = total_ram > ram_reserve ? total_ram - ram_reserve : 512_MiB;
+    const u64 vram_reserve = vram_budget >= 6_GiB ? 2560_MiB : 1536_MiB;
+    const u64 free_vram = vram_budget > vram_reserve ? vram_budget - vram_reserve : 256_MiB;
+    constexpr u64 AvgRamPerPipeline = 300_KiB;
+    constexpr u64 AvgVramPerPipeline = 128_KiB;
+    const size_t by_ram = static_cast<size_t>(free_ram / AvgRamPerPipeline);
+    const size_t by_vram = static_cast<size_t>(free_vram / AvgVramPerPipeline);
+    return std::clamp<size_t>(std::min(by_ram, by_vram), 1024, 32768);
+}
 
 // Shader cache v2: bytes a job's stage is taken to hold for the scheduler's budget. EGLA-80
 // measured ~100 MiB of commit per driver compile in flight (24 at once held ~2.5 GB more than
@@ -1231,6 +1303,18 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         LOG_ERROR(Common_Filesystem, "Failed to create pipeline cache directories");
         return;
     }
+    const auto boot_workers = GetSmartPipelineWorkers(&device, true);
+    const auto gameplay_workers = GetSmartPipelineWorkers(&device, false);
+    shader_jobs->SetActiveWorkerLimits(boot_workers.cpu_workers, boot_workers.driver_workers);
+    LOG_INFO(Render_Vulkan, "Shader worker turbo mode active for boot: {} CPU + {} Driver workers",
+             boot_workers.cpu_workers, boot_workers.driver_workers);
+    SCOPE_EXIT {
+        shader_jobs->SetActiveWorkerLimits(gameplay_workers.cpu_workers,
+                                           gameplay_workers.driver_workers);
+        LOG_INFO(Render_Vulkan,
+                 "Shader worker gameplay mode restored: {} CPU + {} Driver workers",
+                 gameplay_workers.cpu_workers, gameplay_workers.driver_workers);
+    };
     namespace CacheV2 = VideoCommon::ShaderCacheV2;
     pipeline_cache_filename = base_dir / CacheV2::FileName;
     // Left by a boot load that never finished (a driver crash, abort or hang): this boot builds
@@ -1353,11 +1437,17 @@ bool PipelineCache::KeyFitsDevice(const GraphicsPipelineCacheKey& key) const {
            dynamic_features.has_provoking_vertex_tf_preserve;
 }
 
-PipelineBuildQueue PipelineCache::BuildQueue(bool build_in_parallel, u64 cpu_bytes) {
+PipelineBuildQueue PipelineCache::BuildQueue(bool build_in_parallel, u64 cpu_bytes,
+                                             VideoCommon::ShaderJobPriority priority) {
     if (!build_in_parallel) {
-        return {.owner_builds = true};
+        return {.owner_builds = true, .priority = priority};
     }
-    return {.jobs = &*shader_jobs, .cpu_bytes = cpu_bytes, .driver_bytes = DriverCompileBytes};
+    return {
+        .jobs = &*shader_jobs,
+        .cpu_bytes = cpu_bytes,
+        .driver_bytes = DriverCompileBytes,
+        .priority = priority,
+    };
 }
 
 std::shared_ptr<ShaderPools> PipelineCache::TakeSparePools() {
@@ -1593,8 +1683,11 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
         Settings::values.build_all_cached_shaders.GetValue() ||
         VideoCommon::ShaderWarm::WarmRequested(VideoCommon::ShaderWarm::ComputeWarmPath(title_id));
     const size_t kept_pipelines = KeptPipelines();
+    const size_t dynamic_boot_cap = ComputeDynamicBootPipelineCap(device);
+    const size_t max_pipelines_without_used_list =
+        kept_pipelines != 0 ? std::min(dynamic_boot_cap, kept_pipelines) : dynamic_boot_cap;
     const size_t boot_used =
-        used_pipelines.empty() ? MaxPipelinesWithoutUsedList : used_pipelines.size();
+        used_pipelines.empty() ? max_pipelines_without_used_list : used_pipelines.size();
     const size_t spare_pipelines = kept_pipelines == 0
                                        ? std::numeric_limits<size_t>::max()
                                        : kept_pipelines - std::min(kept_pipelines, boot_used);
@@ -1646,7 +1739,7 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
             older_used.push_back({index, *key, used_age->second});
             continue;
         }
-        const bool used = used_pipelines.empty() ? queued_graphics < MaxPipelinesWithoutUsedList
+        const bool used = used_pipelines.empty() ? queued_graphics < max_pipelines_without_used_list
                                                  : used_age != used_pipelines.end();
         const bool spare = !used && build_all && queued_spare < spare_pipelines;
         if (used || spare) {
@@ -1698,7 +1791,9 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
         prebuild.push_back(prebuild_record(index, key));
     }
 
-    for (auto& [key, indices] : compute_keys) {
+    {
+        auto batch_scope = jobs.BeginBatch();
+        for (auto& [key, indices] : compute_keys) {
         ++state.total;
         u64 bytes = 0;
         for (const size_t index : indices) {
@@ -1816,6 +1911,7 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
             &boot);
     }
     boot_graphics.clear();
+    }
 
     const auto add_to_prebuild = [this](PrebuildRecord& record,
                                         VideoCommon::ShaderJobHandle* job = nullptr) {
@@ -1849,6 +1945,7 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
     const size_t deferred_pipelines = prebuild.size();
     std::vector<VideoCommon::ShaderJobHandle> older_jobs;
     const auto start_prebuild = [&] {
+        auto batch_scope = jobs.BeginBatch();
         for (size_t index = 0; index < prebuild.size(); ++index) {
             VideoCommon::ShaderJobHandle job;
             add_to_prebuild(prebuild[index], index < older_admitted ? &job : nullptr);
@@ -1915,7 +2012,7 @@ void PipelineCache::LoadPipelinesV2(u64 title_id,
             MaxUsedPipelineAge(device));
         const std::string chosen =
             used_pipelines.empty() ? fmt::format("no used list: the first {} graphics records",
-                                                 MaxPipelinesWithoutUsedList)
+                                                 max_pipelines_without_used_list)
                                    : fmt::format("the used list of {} pipelines from {} sessions",
                                                  used_pipelines.size(), used_sessions);
         LOG_INFO(
@@ -2154,7 +2251,9 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
         // Background jobs of the shader workers, each built and destroyed: only the driver's
         // cache keeps it.
         const VideoCommon::ShaderJobBatch batch = shader_jobs->CreateBatch();
-        for (size_t index = 0; index < jobs.size(); ++index) {
+        {
+            auto batch_scope = shader_jobs->BeginBatch();
+            for (size_t index = 0; index < jobs.size(); ++index) {
             shader_jobs->Submit(
                 {
                     .priority = VideoCommon::ShaderJobPriority::Background,
@@ -2187,6 +2286,7 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
                     },
                 },
                 &batch);
+            }
         }
         while (!batch.Idle()) {
             if (stop_loading.stop_requested() || ShaderWarm::TakeSkipWarm()) {
@@ -2684,16 +2784,20 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) noexc
                regs.rt[rt_index].format != Tegra::RenderTargetFormat::NONE &&
                regs.color_mask[regs.color_mask_common ? 0 : rt_index].raw != 0;
     };
+    const bool has_color_history =
+        native &&
+        ColorWritesHaveHistory(
+            std::min<u32>(regs.rt_control.count, static_cast<u32>(Maxwell::NumRenderTargets)),
+            [&regs](u32 i) { return regs.rt_control.Map(i); }, writes_color,
+            [this](u32 rt_index) {
+                return texture_cache.ColorTargetWrittenBeforeThisFrame(rt_index);
+            });
     const bool depth_tested =
-        native ? mode != NativePendingMode::Wait && regs.zeta_enable != 0 &&
-                     regs.depth_test_enable != 0 && !regs.IsMeshEnabled() &&
-                     ColorWritesHaveHistory(
-                         std::min<u32>(regs.rt_control.count,
-                                       static_cast<u32>(Maxwell::NumRenderTargets)),
-                         [&regs](u32 i) { return regs.rt_control.Map(i); }, writes_color,
-                         [this](u32 rt_index) {
-                             return texture_cache.ColorTargetWrittenBeforeThisFrame(rt_index);
-                         })
+        native ? mode != NativePendingMode::Wait && !regs.IsMeshEnabled() && has_color_history &&
+                     ((regs.zeta_enable != 0 && regs.depth_test_enable != 0) ||
+                      CanDiscardTransient2DDraw(true, has_color_history, false,
+                                                draw_state.draw_element_count,
+                                                draw_state.instance_count))
                : regs.zeta_enable != 0;
     // Native draws are judged by the heuristic only when a mode other than Wait is chosen.
     const bool can_discard = CanDiscardPendingDraw(
@@ -2785,10 +2889,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::RebuildGraphicsPipeline(KeptGra
         }
         return code;
     };
+    const bool is_vip = graphics_key.state.dynamic_state.depth_write_enable != 0;
+    const auto priority = is_vip ? VideoCommon::ShaderJobPriority::Vip
+                                 : VideoCommon::ShaderJobPriority::Soon;
     auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, pipeline_binaries.get(),
         &shader_notify, device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
-        BuildQueue(true, bytes), nullptr, render_pass_cache, graphics_key,
+        BuildQueue(true, bytes, priority), nullptr, render_pass_cache, graphics_key,
         std::array<std::vector<u32>, Maxwell::MaxShaderStage>{}, infos, std::move(emit),
         std::move(kept.mesh_emulation));
     pipeline->SetMappedPointers(std::move(kept.mapped_pointers));
@@ -3260,7 +3367,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (defer_emission) {
             deferred_runtime_infos[stage_index] = runtime_info;
             if (VideoCommon::Nx2Perf::Verify()) {
-                reference_spirv[stage_index] = EmitSPIRV(profile, runtime_info, program, binding);
+                reference_spirv[stage_index] = EmitPipelineShader(
+                    profile, runtime_info, program, binding, key.unique_hashes[index]);
             }
         } else {
             const auto begin = std::chrono::steady_clock::now();
@@ -3318,10 +3426,13 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             mapped_pointers[index] = envs[mapped_env++]->MappedStoragePointerKeys();
         }
     }
+    const bool is_vip = key.state.dynamic_state.depth_write_enable != 0;
+    const auto priority = is_vip ? VideoCommon::ShaderJobPriority::Vip
+                                 : VideoCommon::ShaderJobPriority::Soon;
     auto pipeline = std::make_unique<GraphicsPipeline>(
         scheduler, buffer_cache, texture_cache, vulkan_pipeline_cache, pipeline_binaries.get(),
         &shader_notify, device, descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
-        BuildQueue(build_in_parallel, defer_emission ? deferred_ir_bytes : 0), statistics,
+        BuildQueue(build_in_parallel, defer_emission ? deferred_ir_bytes : 0, priority), statistics,
         render_pass_cache, key, std::move(stage_spirv), infos, std::move(emit_stages),
         std::move(mesh_emulation));
     pipeline->SetMappedPointers(std::move(mapped_pointers));
@@ -3745,7 +3856,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         pipeline = std::make_unique<ComputePipeline>(
             device, scheduler, vulkan_pipeline_cache, pipeline_binaries.get(), hash,
             descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
-            BuildQueue(build_in_parallel, ir_bytes), statistics,
+            BuildQueue(build_in_parallel, ir_bytes, VideoCommon::ShaderJobPriority::Vip), statistics,
             &shader_notify, info, vk::ShaderModule{}, key.unique_hash, std::vector<u8>{},
             std::move(emit));
     } else {
@@ -3763,7 +3874,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         pipeline = std::make_unique<ComputePipeline>(
             device, scheduler, vulkan_pipeline_cache, pipeline_binaries.get(), hash,
             descriptor_pool, guest_descriptor_queue, descriptor_buffer_ring,
-            BuildQueue(build_in_parallel), statistics, &shader_notify, info, std::move(module),
+            BuildQueue(build_in_parallel, 0, VideoCommon::ShaderJobPriority::Vip), statistics, &shader_notify, info, std::move(module),
             key.unique_hash, std::move(kept_spirv));
     }
     return {.pipeline = std::move(pipeline),

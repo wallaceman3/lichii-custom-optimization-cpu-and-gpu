@@ -50,6 +50,7 @@
 #include "video_core/texture_cache/render_targets.h"
 #include "video_core/texture_cache/sampled_views.h"
 #include "video_core/texture_cache/stale_pages.h"
+#include "video_core/texture_cache/superseded_images.h"
 #include "video_core/texture_cache/types.h"
 #include "video_core/texture_cache/writeback_ranges.h"
 #include "video_core/textures/texture.h"
@@ -543,6 +544,9 @@ private:
     /// Runs the Garbage Collector; at_critical collects as if usage were at the critical threshold.
     void RunGarbageCollector(bool out_of_memory, bool at_critical);
 
+    /// Deletes images whose memory went entirely to newer images (see ClassifySuperseded).
+    void DeleteSupersededImages();
+
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);
 
@@ -865,6 +869,13 @@ private:
     u64 tc_stale_skips{};        ///< Uploads skipped (last 600 frames)
     u64 tc_stale_skip_bytes{};
     u64 tc_stale_gpu_written{};  ///< Stale but buffer-written pages: uploaded after all
+
+    // Superseded images (DeleteSupersededImages)
+    std::vector<ImageId> superseded_ids;
+    u64 superseded_activity_frame{}; ///< Last frame a bad overlap appeared or a clear wrote whole
+    u64 superseded_clean_deletes{};
+    u64 superseded_rewritten_deletes{};
+    u64 superseded_unproven{}; ///< Candidates kept for lack of proof, per scan
 
     /// The CPU address an image at gpu_addr is keyed by: its backing, or a fixed stand-in.
     [[nodiscard]] std::optional<DAddr> ImageCpuAddress(GPUVAddr gpu_addr, size_t size) const;

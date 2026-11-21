@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <thread>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
@@ -31,6 +32,8 @@ namespace {
 std::array<Dynarmic::A64::UserConfig::Counters, Hardware::NUM_CPU_CORES> g_jit_counters{};
 // EDEN_NX2_STUTTER_TRACE: each core's counters already added to the stutter trace.
 std::array<Dynarmic::A64::UserConfig::Counters, Hardware::NUM_CPU_CORES> g_jit_traced{};
+// Code invalidations of any core: each core's cached code page is stale after one.
+std::atomic<u64> g_code_invalidations{0};
 
 void TraceJit(size_t core) {
     const auto& now = g_jit_counters[core];
@@ -92,11 +95,11 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
         return std::nullopt;
     auto const aligned_vaddr = vaddr & ~Core::Memory::LICHII_PAGEMASK;
-    const u32 generation = code_generation.load(std::memory_order_acquire);
-    if (last_code_addr != aligned_vaddr || cached_code_generation != generation) {
+    const u64 invalidations = g_code_invalidations.load(std::memory_order_acquire);
+    if (last_code_addr != aligned_vaddr || code_invalidations != invalidations) {
         m_memory.ReadBlock(aligned_vaddr, &cached_code_page, sizeof(cached_code_page));
         last_code_addr = aligned_vaddr;
-        cached_code_generation = generation;
+        code_invalidations = invalidations;
     }
     const u32 instruction = cached_code_page.inst[(vaddr & Core::Memory::LICHII_PAGEMASK) / sizeof(u32)];
     if (WindowTrace::Enabled() && m_process->GetProgramId() == WindowTrace::ProgramId) {
@@ -299,12 +302,19 @@ static bool CntpctPauseEnabled() {
 u64 DynarmicCallbacks64::GetCNTPCT() {
     const u64 ticks = m_parent.m_system.CoreTiming().GetClockTicks();
     if (CntpctPauseEnabled() && ticks - m_last_cntpct < m_spin_ticks) {
+        if (++m_consecutive_spin_polls >= 256) {
+            m_consecutive_spin_polls = 0;
+            std::this_thread::yield();
+        } else {
 #if defined(_M_X64) || defined(__x86_64__)
-        _mm_pause();
-        _mm_pause();
+            _mm_pause();
+            _mm_pause();
 #elif defined(__aarch64__)
-        asm volatile("yield");
+            asm volatile("yield");
 #endif
+        }
+    } else {
+        m_consecutive_spin_polls = 0;
     }
     m_last_cntpct = ticks;
     if (Kernel::Nx2ThreadStats::g_enabled) {
@@ -520,6 +530,7 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         config.counters = &g_jit_counters[m_core_index];
     }
 #if defined(ARCHITECTURE_x86_64)
+    config.enable_avx2 = Settings::values.cpuopt_intel_avx2.GetValue();
     // x86-64 host code generation options; Paranoid keeps dynarmic's defaults.
     if (Settings::values.cpu_accuracy.GetValue() != Settings::CpuAccuracy::Paranoid) {
         // The JIT spilled ~9% of its instructions to stack slots in Ocarina of Time's hot code
@@ -557,6 +568,14 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         // address: the CPU's return predictor predicts guest returns instead of one shared
         // indirect jump through the return stack buffer (multicore only, no cycle counter).
         config.host_call_return = !config.enable_cycle_counting;
+        // One code cache for all cores of the process: a block is compiled once, not per core
+        // (72-74% of the six caches' code was duplicated in Ocarina of Time). 1 GiB of address
+        // space, committed as used.
+        if (m_shared_code_cache && config.host_call_return && page_table &&
+            !config.check_halt_on_memory_access) {
+            config.shared_code_cache = m_shared_code_cache;
+            config.code_cache_size = std::uint32_t(1_GiB);
+        }
     }
 #endif
     m_jit.emplace(config);
@@ -623,10 +642,11 @@ void ArmDynarmic64::RewindBreakpointInstruction() {
     this->SetContext(m_breakpoint_context);
 }
 
-ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index)
+ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index, std::shared_ptr<Dynarmic::A64::SharedCodeCache> shared_code_cache)
     : ArmInterface{uses_wall_clock}, m_system{system}, m_exclusive_monitor{exclusive_monitor}
     , m_cb(std::in_place, *this, process)
     , m_core_index{core_index}
+    , m_shared_code_cache{std::move(shared_code_cache)}
 {
     auto& page_table = process->GetPageTable().GetBasePageTable();
     auto& page_table_impl = page_table.GetImpl();
@@ -680,7 +700,8 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic64::ClearInstructionCache() {
-    m_cb->code_generation.fetch_add(1, std::memory_order_release);
+    m_cb->last_code_addr = u64(-1);
+    g_code_invalidations.fetch_add(1, std::memory_order_release);
     m_jit->ClearCache();
 }
 
@@ -688,7 +709,8 @@ void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
     // Drop the cached code page too: blocks recompiled after the invalidation would
     // otherwise still decode the old instructions (e.g. a gdbstub breakpoint written
     // into or removed from that page).
-    m_cb->code_generation.fetch_add(1, std::memory_order_release);
+    m_cb->last_code_addr = u64(-1);
+    g_code_invalidations.fetch_add(1, std::memory_order_release);
     m_jit->InvalidateCacheRange(addr, size);
 }
 

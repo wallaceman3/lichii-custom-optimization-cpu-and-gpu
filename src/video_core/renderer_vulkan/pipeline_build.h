@@ -68,13 +68,14 @@ private:
 
 /// Where a pipeline is built. Without jobs it is built in its constructor.
 struct PipelineBuildQueue {
-    /// A Soon job of this scheduler, whose CPU stage is the pipeline's deferred SPIR-V emission if
+    /// A job of this scheduler, whose CPU stage is the pipeline's deferred SPIR-V emission if
     /// it has one, and whose driver stage builds it. The estimates are the job's.
     VideoCommon::ShaderJobScheduler* jobs{};
     u64 cpu_bytes{};
     u64 driver_bytes{};
     /// Left for Build(), the driver stage of the job that translated it
     bool owner_builds{};
+    VideoCommon::ShaderJobPriority priority{VideoCommon::ShaderJobPriority::Soon};
 };
 
 class PipelineBuild {
@@ -131,7 +132,7 @@ public:
           owner_builds{queue.owner_builds} {
         if (jobs) {
             VideoCommon::ShaderJob job{
-                .priority = VideoCommon::ShaderJobPriority::Soon,
+                .priority = queue.priority,
                 .cpu_bytes = queue.cpu_bytes,
                 .driver_bytes = queue.driver_bytes,
             };

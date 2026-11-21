@@ -64,14 +64,16 @@ public:
 
     Dynarmic::CodePage cached_code_page;
     u64 last_code_addr = u64(-1);
-    u32 cached_code_generation = 0;
-    std::atomic<u32> code_generation{0};
+    /// g_code_invalidations when cached_code_page was read: with a shared code cache, a core
+    /// may translate code another core invalidated.
+    u64 code_invalidations = 0;
     ArmDynarmic64& m_parent;
     Core::Memory::Memory& m_memory;
     u64 m_tpidrro_el0{};
     u64 m_tpidr_el0{};
     u64 m_last_cntpct{}; ///< The previous counter read (GetCNTPCT spin detection)
     u64 m_spin_ticks{32}; ///< Reads closer than this (~1.7 us) count as a polling loop
+    u32 m_consecutive_spin_polls{}; ///< Number of consecutive spin-poll reads without delay
     Kernel::KProcess* m_process{};
     std::shared_ptr<WindowTrace::Session> m_window_trace;
     const bool m_debugger_enabled{};
@@ -81,8 +83,10 @@ public:
 
 class ArmDynarmic64 final : public ArmInterface {
 public:
+    /// `shared_code_cache`: the process's cores share one JIT code cache, where supported.
     ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process,
-                  DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index);
+                  DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index,
+                  std::shared_ptr<Dynarmic::A64::SharedCodeCache> shared_code_cache = {});
     ~ArmDynarmic64() override;
 
     Architecture GetArchitecture() const override {
@@ -118,6 +122,7 @@ private:
     void MakeJit(Common::PageTable* page_table, std::size_t address_space_bits);
     std::optional<DynarmicCallbacks64> m_cb{};
     std::size_t m_core_index{};
+    std::shared_ptr<Dynarmic::A64::SharedCodeCache> m_shared_code_cache;
 
     std::optional<Dynarmic::A64::Jit> m_jit{};
 

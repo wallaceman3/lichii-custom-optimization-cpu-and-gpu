@@ -163,17 +163,41 @@ TEST_CASE("Shader jobs run the highest priority first", "[video_core][shader_job
     REQUIRE(order.Get() == std::vector<int>{3, 2, 4, 1, 5});
     REQUIRE(queued.priorities[0].running == 1);
     REQUIRE(queued.priorities[0].queued == 1);
-    REQUIRE(queued.priorities[1].queued == 2);
+    REQUIRE(queued.priorities[1].queued == 0);
     REQUIRE(queued.priorities[2].queued == 2);
+    REQUIRE(queued.priorities[3].queued == 2);
     REQUIRE(stats.priorities[0].done == 2);
-    REQUIRE(stats.priorities[1].done == 2);
+    REQUIRE(stats.priorities[1].done == 0);
     REQUIRE(stats.priorities[2].done == 2);
+    REQUIRE(stats.priorities[3].done == 2);
     for (const auto& priority : stats.priorities) {
         REQUIRE(priority.queued == 0);
         REQUIRE(priority.running == 0);
     }
-    REQUIRE(stats.priorities[2].queue_wait_ns > 0);
-    REQUIRE(stats.priorities[2].max_queue_wait_ns <= stats.priorities[2].queue_wait_ns);
+    REQUIRE(stats.priorities[3].queue_wait_ns > 0);
+    REQUIRE(stats.priorities[3].max_queue_wait_ns <= stats.priorities[3].queue_wait_ns);
+}
+
+TEST_CASE("Shader jobs run Vip priority before Soon", "[video_core][shader_jobs]") {
+    ShaderJobScheduler scheduler{Config(1, 1)};
+    Gate gate;
+    const auto blocker = Block(scheduler, gate);
+    Order order;
+    std::vector<ShaderJobHandle> jobs;
+    jobs.push_back(scheduler.Submit(CpuJob(Background, [&] { order.Add(1); })));
+    jobs.push_back(scheduler.Submit(CpuJob(Soon, [&] { order.Add(2); })));
+    jobs.push_back(scheduler.Submit(CpuJob(Vip, [&] { order.Add(3); })));
+    jobs.push_back(scheduler.Submit(CpuJob(NeedNow, [&] { order.Add(4); })));
+    jobs.push_back(scheduler.Submit(CpuJob(Soon, [&] { order.Add(5); })));
+    jobs.push_back(scheduler.Submit(CpuJob(Vip, [&] { order.Add(6); })));
+    jobs.push_back(scheduler.Submit(CpuJob(Background, [&] { order.Add(7); })));
+    gate.Open();
+    for (const auto& job : jobs) {
+        job.Wait();
+    }
+    blocker.Wait();
+    // Expected order: NeedNow (4) -> Vip (3, 6) -> Soon (2, 5) -> Background (1, 7)
+    REQUIRE(order.Get() == std::vector<int>{4, 3, 6, 2, 5, 1, 7});
 }
 
 TEST_CASE("Shader jobs promote queued jobs in both queues", "[video_core][shader_jobs]") {
@@ -199,8 +223,9 @@ TEST_CASE("Shader jobs promote queued jobs in both queues", "[video_core][shader
         REQUIRE(second.Priority() == Soon);
         REQUIRE(first.Priority() == Background);
         REQUIRE(promoted.priorities[0].queued == 1);
-        REQUIRE(promoted.priorities[1].queued == 1);
+        REQUIRE(promoted.priorities[1].queued == 0);
         REQUIRE(promoted.priorities[2].queued == 1);
+        REQUIRE(promoted.priorities[3].queued == 1);
         REQUIRE(scheduler.Stats().priorities[0].done == 2);
         REQUIRE(order.Get() == std::vector<int>{3, 2, 1});
     }
@@ -429,7 +454,7 @@ TEST_CASE("Shader jobs cancel queued and running jobs", "[video_core][shader_job
         REQUIRE(cancelled_at_once);
         REQUIRE(released_at_once);
         REQUIRE_FALSE(ran);
-        REQUIRE(scheduler.Stats().priorities[2].cancelled == 1);
+        REQUIRE(scheduler.Stats().priorities[3].cancelled == 1);
     }
     SECTION("Running CPU stage") {
         bool driver_ran{};
@@ -590,8 +615,8 @@ TEST_CASE("Shader job stage exceptions fail only that job", "[video_core][shader
     }
     REQUIRE(caught_message);
     REQUIRE(caught_int);
-    REQUIRE(stats.priorities[1].failed == 2);
-    REQUIRE(stats.priorities[1].done == 1);
+    REQUIRE(stats.priorities[2].failed == 2);
+    REQUIRE(stats.priorities[2].done == 1);
     REQUIRE(stats.in_flight_bytes == 0);
 }
 
@@ -698,7 +723,8 @@ TEST_CASE("Shader jobs stay consistent with many producers", "[video_core][shade
             std::mt19937 random{static_cast<u32>(producer)};
             for (int i = 0; i < JobsPerProducer; ++i) {
                 const size_t index = static_cast<size_t>(producer * JobsPerProducer + i);
-                const auto priority = static_cast<ShaderJobPriority>(random() % 3);
+                const auto priority =
+                    static_cast<ShaderJobPriority>(random() % VideoCommon::NumShaderJobPriorities);
                 Runs& run = runs[index];
                 handles[index] = scheduler.Submit(
                     TwoStageJob(
@@ -791,6 +817,40 @@ TEST_CASE("ParallelFor calls every index once, helped by the calling thread",
         blocker.Wait();
     }
     REQUIRE(here == 50);
+}
+
+TEST_CASE("Shader jobs batch submit executes all jobs", "[video_core][shader_jobs]") {
+    ShaderJobScheduler scheduler{Config(2, 1)};
+    std::vector<int> results(10, 0);
+    std::vector<ShaderJob> jobs;
+    for (int i = 0; i < 10; ++i) {
+        jobs.push_back(CpuJob(Soon, [&results, i] { results[i] = i + 1; }));
+    }
+    auto handles = scheduler.Submit(jobs);
+    for (auto& handle : handles) {
+        handle.Wait();
+    }
+    for (int i = 0; i < 10; ++i) {
+        REQUIRE(results[i] == i + 1);
+    }
+}
+
+TEST_CASE("Shader jobs batch scope coalesces notifications", "[video_core][shader_jobs]") {
+    ShaderJobScheduler scheduler{Config(2, 1)};
+    std::vector<int> results(10, 0);
+    std::vector<ShaderJobHandle> handles;
+    {
+        auto scope = scheduler.BeginBatch();
+        for (int i = 0; i < 10; ++i) {
+            handles.push_back(scheduler.Submit(CpuJob(Soon, [&results, i] { results[i] = i + 1; })));
+        }
+    }
+    for (auto& handle : handles) {
+        handle.Wait();
+    }
+    for (int i = 0; i < 10; ++i) {
+        REQUIRE(results[i] == i + 1);
+    }
 }
 
 namespace {

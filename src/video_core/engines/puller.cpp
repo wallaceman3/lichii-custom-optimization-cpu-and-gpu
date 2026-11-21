@@ -175,6 +175,10 @@ AcquireCheck CheckWithoutDrain(DmaPusher& dma_pusher, const Puller::PendingAcqui
                 // passes it early; the 1 ms valve drains for writes the front did not note.
                 return AcquireCheck::NotMet;
             }
+            // If guest memory already satisfies the acquire condition, avoid an expensive pipeline drain.
+            if (acquire.Matches(dma_pusher.memory_manager.Read<u32>(acquire.address))) {
+                return AcquireCheck::Met;
+            }
             VideoCommon::Count(stats.drain_queued);
             if (VideoCommon::g_acquire_counting && !queued->known) {
                 VideoCommon::Count(stats.queued_unknown);

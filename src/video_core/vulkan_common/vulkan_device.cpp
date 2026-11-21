@@ -38,6 +38,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/shader_cache_v2/cache.h"
+#include "video_core/vram_target.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
@@ -1089,17 +1090,17 @@ VideoCommon::Fsr4PortDevice Device::Fsr4PortDevice() const {
     };
 }
 
-VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
+VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type, bool create) const {
     std::scoped_lock lk{separate_pools_mutex};
     VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
-    if (pool == VK_NULL_HANDLE) {
+    if (pool == VK_NULL_HANDLE && create) {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
             .blockSize = kind == SeparatePool::DeviceBuffers ? device_buffer_pool_block_size
                                                              : SeparatePoolBlockSize,
             .minBlockCount = 0,
-            .maxBlockCount = 0,
+            .maxBlockCount = kind == SeparatePool::RenderTargets ? 32u : 0u,
             .priority = 0.f,
             .minAllocationAlignment = 0,
             .pMemoryAllocateNext = nullptr,
@@ -2467,6 +2468,9 @@ u64 Device::GetDeviceMemoryBudget() const {
         // gives it (4 GiB, 6 GiB with aggressive VRAM use).
         result = (std::min)(result, device_access_memory);
     }
+    if (vram_target != 0) {
+        result = (std::min)(result, vram_target);
+    }
     return result;
 }
 
@@ -2557,19 +2561,24 @@ void Device::CollectPhysicalMemoryInfo() {
                      device_buffer_pool_block_size >> 20, main_heap_size >> 20,
                      main_heap_budget >> 20);
         }
+    const Settings::VramUsageMode vram_mode = Settings::values.vram_usage_mode.GetValue();
+    const u64 total_gpu_vram = is_integrated ? device_access_memory : main_heap_size;
+    vram_target = VideoCommon::VramTarget(vram_mode, total_gpu_vram);
+    if (vram_target != 0) {
+        LOG_INFO(Render_Vulkan, "VRAM usage mode {}: target {} MiB (total VRAM {} MiB)",
+                 Settings::CanonicalizeEnum(vram_mode), vram_target >> 20, total_gpu_vram >> 20);
+    } else {
+        LOG_INFO(Render_Vulkan, "VRAM usage mode {}: no target (total VRAM {} MiB)",
+                 Settings::CanonicalizeEnum(vram_mode), total_gpu_vram >> 20);
+    }
     }
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
         const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;
         device_access_memory = static_cast<u64>(std::max<s64>(std::min<s64>(available_memory - 8_GiB, memory_size), std::min<s64>(local_memory, memory_size)));
     } else {
-        const u64 reserve_memory = std::min<u64>(device_access_memory / 8, 1_GiB);
-        device_access_memory -= reserve_memory;
-        if (Settings::values.vram_usage_mode.GetValue() != Settings::VramUsageMode::Aggressive) {
-            // Account for resolution scaling in memory limits
-            const size_t normal_memory = 6_GiB;
-            const size_t scaler_memory = 1_GiB * Settings::values.resolution_info.ScaleUp(1);
-            device_access_memory = std::min<u64>(device_access_memory, normal_memory + scaler_memory);
+        if (vram_target != 0) {
+            device_access_memory = (std::min)(device_access_memory, vram_target);
         }
     }
 }

@@ -24,6 +24,8 @@ class ExclusiveMonitor;
 namespace Dynarmic {
 namespace A64 {
 
+struct SharedCodeCache;
+
 using VAddr = std::uint64_t;
 
 using Vector = std::array<std::uint64_t, 2>;
@@ -212,6 +214,11 @@ struct UserConfig {
     // Maximum size is limited by the maximum length of a x86_64 / arm64 jump.
     std::uint32_t code_cache_size = 128 * 1024 * 1024;  // bytes
 
+    /// x64 backend: Jits made with the same cache (MakeSharedCodeCache) run each other's code.
+    /// They must emulate one process (same page table and fastmem arena), count no cycles, use
+    /// compact_block_exits and be destroyed together. The first Jit's config sizes the cache.
+    std::shared_ptr<SharedCodeCache> shared_code_cache;
+
     /// Diagnostics: when set, the x64 backend counts here the dispatcher's C++ block lookups,
     /// compiled blocks, full code cache clears and handled fastmem faults; the arm64 backend
     /// counts compiled blocks, compile time, full code cache clears and the fields marked arm64.
@@ -240,6 +247,9 @@ struct UserConfig {
 
     /// Processor ID
     std::uint8_t processor_id = 0;
+
+    /// When set to false, disables host AVX2 instruction emission in the JIT backend.
+    bool enable_avx2 = true;
 
     /// This enables unsafe optimizations that reduce emulation accuracy in favour of speed.
     /// For safety, in order to enable unsafe optimizations you have to set BOTH this flag

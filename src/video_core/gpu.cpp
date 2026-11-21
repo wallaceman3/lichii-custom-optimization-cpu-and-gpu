@@ -13,6 +13,10 @@
 #include <optional>
 #include <utility>
 
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
+
 #include "common/assert.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -204,9 +208,22 @@ struct GPU::Impl {
     /// Returns once the request of `fence` ran, or once the GPU threads stopped for good
     /// (NotifyShutdown): then it never runs.
     void WaitForSyncOperation(const u64 fence) {
+        if (current_sync_fence.load(std::memory_order_acquire) >= fence || sync_requests_dropped) {
+            return;
+        }
+        for (int i = 0; i < 200; ++i) {
+#if defined(_M_X64) || defined(__x86_64__)
+            _mm_pause();
+#else
+            std::this_thread::yield();
+#endif
+            if (current_sync_fence.load(std::memory_order_acquire) >= fence || sync_requests_dropped) {
+                return;
+            }
+        }
         std::unique_lock lck{sync_request_mutex};
         sync_request_cv.wait(lck, [this, fence] {
-            return CurrentSyncRequestFence() >= fence || sync_requests_dropped;
+            return current_sync_fence.load(std::memory_order_acquire) >= fence || sync_requests_dropped;
         });
     }
 
@@ -350,13 +367,7 @@ struct GPU::Impl {
             return raster_area;
         }
         raster_area.preemtive = true;
-        // A guest CPU read of GPU-written memory (reactive flushing): count them, they decide
-        // whether buffer data must be copied back at every fence (EDEN_NX2_BUFFER_DOWNLOADS).
-        if (static std::atomic<u64> reads{}; (reads.fetch_add(1, std::memory_order_relaxed) & 63) == 0) {
-            LOG_INFO(HW_GPU, "CPU read of GPU-written memory [{:#x}, {:#x}) ({} so far)",
-                     raster_area.start_address, raster_area.end_address,
-                     reads.load(std::memory_order_relaxed));
-        }
+        Tegra::g_telemetry_on_cpu_reads.fetch_add(1, std::memory_order_relaxed);
         namespace AsyncReadback = VideoCore::AsyncReadback;
         const u64 request = AsyncReadback::Now();
         const u64 area_size = raster_area.end_address - raster_area.start_address;

@@ -74,6 +74,10 @@ public:
 
     void Finish();
 
+    [[nodiscard]] bool IsIntegrated() const noexcept {
+        return false;
+    }
+
     void FlushDeferredClear() {}
 
     StagingBufferMap UploadStagingBuffer(size_t size, bool deferred = false);
@@ -83,6 +87,10 @@ public:
     void FreeDeferredStagingBuffer(StagingBufferMap& buffer);
 
     u64 GetDeviceLocalMemory() const {
+        return device_access_memory;
+    }
+
+    u64 GetDeviceLocalHeapSize() const {
         return device_access_memory;
     }
 

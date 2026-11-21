@@ -358,7 +358,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
     if (build_queue.jobs) {
         jobs = build_queue.jobs;
         VideoCommon::ShaderJob build_job{
-            .priority = VideoCommon::ShaderJobPriority::Soon,
+            .priority = build_queue.priority,
             .cpu_bytes = build_queue.cpu_bytes,
             .driver_bytes = build_queue.driver_bytes,
         };

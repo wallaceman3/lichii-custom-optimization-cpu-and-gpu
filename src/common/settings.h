@@ -84,7 +84,7 @@ SWITCHABLE(RendererBackend, true);
 SWITCHABLE(ScalingFilter, false);
 SWITCHABLE(SpirvOptimizeMode, true);
 SWITCHABLE(TimeZone, true);
-SETTING(VSyncMode, true);
+SWITCHABLE(VSyncMode, true);
 SWITCHABLE(bool, false);
 SWITCHABLE(int, false);
 SWITCHABLE(int, true);
@@ -297,6 +297,8 @@ struct Values {
                                            true,
                                            true,
                                            &use_custom_cpu_ticks};
+
+    SwitchableSetting<bool> cpuopt_intel_avx2{linkage, true, "cpuopt_intel_avx2", Category::Cpu};
 
     Setting<bool> cpuopt_page_tables{linkage, true, "cpuopt_page_tables", Category::CpuDebug};
     Setting<bool> cpuopt_block_linking{linkage, true, "cpuopt_block_linking", Category::CpuDebug};

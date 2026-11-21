@@ -137,6 +137,10 @@ struct ImageBase {
     /// At least the newest modification_tick among aliased_images (raised when an alias's tick is
     /// set or an alias is added): SynchronizeAliases has nothing to do while it is not newer.
     u64 newest_alias_tick = 0;
+    /// modification_tick of the latest GPU write that covered the whole image (a clear).
+    u64 full_write_tick = 0;
+    /// Last frame the image was prepared for use in (TextureCache::PrepareImage), 0 before.
+    u64 last_use_frame = 0;
     /// The cache's modification counter when the image took its contents from guest memory or
     /// other images (made, or uploaded again), or a clear replaced all of them: write-backs noted
     /// after it are bytes it holds older copies of, unless it rendered over them itself (which the
