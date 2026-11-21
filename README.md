@@ -115,6 +115,11 @@ An enhanced, high-performance fork of **[zortos293/Lichii](https://github.com/zo
 - **Macro 0x142 DMA Page Cache:** Caches the last clean 4 KiB DMA page in `MacroEngine::Execute`, avoiding hundreds of redundant `FlushPending` / `IsMemoryDirty` lock acquisitions during 24-byte coordinate batch reads.
 - **Abandoned Query Suppression:** Automatically suspends `StartCounter` / `EndCounter` when 4 consecutive 1024-slot batches of `SamplesPassed` queries are dropped without reading, immediately reactivating upon the guest's first `ResetCounter` / `WriteCounter`.
 
+### 22. Dynamic VRAM Driver Budget Enforcement & Fail-Safe Allocation (Credits: Tasarren)
+- **Driver-Informed Effective Budget:** Binds texture cache thresholds directly to the driver's DXGI heap memory budget (`GetDeviceMemoryBudget`) while bounding at 85% physical VRAM, preventing overcommitment and eliminating driver-level host commit spilling on 8 GB GPUs.
+- **Fail-Safe Memory Allocator:** Guards relaxed VMA budget allocations with a 512 MiB host system commit headroom check, suppresses uncaught `vk::Exception` aborts on `VK_ERROR_OUT_OF_DEVICE_MEMORY` and `VK_ERROR_OUT_OF_HOST_MEMORY` in `MemoryAllocator::CreateImage` / `CreateBuffer`, and safely falls back to native resolution on failed texture upscales.
+- **Adaptive Eviction Pacing:** Dynamically applies 3-tier eviction windows (10 frames at 64 iterations in emergency mode, 25 frames at 32 iterations in high priority), ensuring timely texture reclamation during active scenes and avoiding memory backlog.
+
 ---
 
 ## 🎮 Recommended Settings Guide

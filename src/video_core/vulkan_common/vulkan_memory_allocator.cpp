@@ -221,7 +221,10 @@ MemoryAllocator::~MemoryAllocator() = default;
 vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
 {
     vk::Image image;
-    vk::Check(AllocateImage(ci, dedicated, false, image));
+    const VkResult result = AllocateImage(ci, dedicated, false, image);
+    if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
+        vk::Check(result);
+    }
     return image;
 }
 
@@ -283,9 +286,12 @@ VkResult MemoryAllocator::AllocateImage(const VkImageCreateInfo &ci, bool dedica
                         ci.arrayLayers, static_cast<u32>(ci.format));
         }
         pressure_events.fetch_add(1, std::memory_order_relaxed);
-        VmaAllocationCreateInfo relaxed = alloc_ci;
-        relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-        result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        const auto commit_room = Common::GetSystemCommitRoom();
+        if (!commit_room || *commit_room > (u64{512} << 20)) {
+            VmaAllocationCreateInfo relaxed = alloc_ci;
+            relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateImage(allocator, &ci, &relaxed, &handle, &allocation, &alloc_info);
+        }
     }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
         pressure_events.fetch_add(1, std::memory_order_relaxed);
@@ -527,7 +533,10 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci,
 
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const {
     vk::Buffer buffer;
-    vk::Check(AllocateBuffer(ci, usage, 0, buffer));
+    const VkResult result = AllocateBuffer(ci, usage, 0, buffer);
+    if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
+        vk::Check(result);
+    }
     return buffer;
 }
 
@@ -632,7 +641,10 @@ VkResult MemoryAllocator::AllocateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
 vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
                                          VkDeviceSize min_alignment) const {
     vk::Buffer buffer;
-    vk::Check(AllocateBuffer(ci, usage, min_alignment, buffer));
+    const VkResult result = AllocateBuffer(ci, usage, min_alignment, buffer);
+    if (result != VK_ERROR_OUT_OF_DEVICE_MEMORY && result != VK_ERROR_OUT_OF_HOST_MEMORY) {
+        vk::Check(result);
+    }
     return buffer;
 }
 

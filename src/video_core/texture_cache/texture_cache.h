@@ -251,15 +251,15 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool at_critical) 
 
         if (emergency_mode) {
             // Emergency: rapid eviction of cold images to avoid driver OOM
-            mode_age = 15ULL;
-            num_iterations = 128;
+            mode_age = 10ULL;
+            num_iterations = 64;
         } else if (high_priority_mode) {
             // Moderate pressure: steady eviction of stale assets, avoiding thrashing in turns
-            mode_age = 60ULL;
+            mode_age = 25ULL;
             num_iterations = 32;
         } else {
             // Normal operation (<75%): relaxed retention, zero thrashing in track curves
-            mode_age = 90ULL;
+            mode_age = 50ULL;
             num_iterations = 16;
         }
         // EDEN_NX2_TC_MIN_AGE=<frames>: keep images used more recently while there is room
@@ -268,8 +268,9 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool at_critical) 
             const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
             return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
         }();
-        ticks_to_destroy =
-            EvictionAge(mode_age, min_age, total_used_memory, retention_limit, emergency_mode);
+        ticks_to_destroy = (emergency_mode || high_priority_mode)
+            ? mode_age
+            : EvictionAge(mode_age, min_age, total_used_memory, retention_limit, false);
     };
     // GPU-written images that overlap others without fitting them (BadOverlap) were dropped
     // without a download, their pages marked stale. The Duskbloods renders its characters'
@@ -1609,7 +1610,11 @@ void TextureCache<P>::TickFrame() {
                         }
                         return budget;
                     }();
-                    const u64 margin = (std::min)(total_gpu_vram / 10, 1_GiB);
+                    const u64 effective_budget =
+                        (total_gpu_vram > 0 && budget > 0)
+                            ? (std::min)(budget, total_gpu_vram * 85 / 100)
+                            : (budget > 0 ? budget : total_gpu_vram * 85 / 100);
+                    const u64 margin = (std::min)(effective_budget / 10, 1_GiB);
                     if constexpr (requires { runtime.GetDeviceMemorySlack(); }) {
                         // The usage counted here leaves out the unused part of the allocator's
                         // blocks, which the driver counts and a full heap cannot hand to a new
@@ -1623,10 +1628,9 @@ void TextureCache<P>::TickFrame() {
                                            : slack_margin - (std::min)(slack_margin - slack, 16_MiB);
                     }
                     const u64 reserved = fit_margin + slack_margin;
-                    critical_memory = (total_gpu_vram * 85 / 100) - (std::min)(reserved, total_gpu_vram / 8);
-                    if (budget != 0) {
-                        critical_memory = (std::min)(critical_memory, budget);
-                    }
+                    critical_memory = effective_budget > 0
+                        ? effective_budget - (std::min)(reserved, effective_budget / 2)
+                        : (total_gpu_vram * 85 / 100) - (std::min)(reserved, total_gpu_vram / 8);
                     // The device's budget is not all the room there is: see HostCriticalMemory.
                     // The usage is the driver's, which still counts images waiting to be freed.
                     const std::optional<u64> commit_room = Common::GetSystemCommitRoom();
@@ -1635,14 +1639,11 @@ void TextureCache<P>::TickFrame() {
                             ? HostCriticalMemory(runtime.GetDeviceMemoryUsage(), *commit_room)
                             : (std::numeric_limits<u64>::max)();
                     critical_memory = (std::min)(critical_memory, host_critical);
-                    retention_budget = RetentionBudget(retention_budget, budget);
+                    retention_budget = RetentionBudget(retention_budget, effective_budget);
                     const u64 room_margin =
                         (std::min)(fit_margin + slack_margin, retention_budget / 2);
                     retention_limit = (std::min)(retention_budget - room_margin, host_critical);
-                    expected_memory = total_gpu_vram * 75 / 100;
-                    if (expected_memory >= critical_memory) {
-                        expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
-                    }
+                    expected_memory = critical_memory - (std::min)(margin, critical_memory / 2);
                     ApplyThresholdOverrides(false);
                     u64 other_memory = 0;
                     if constexpr (requires { runtime.GetDeviceHeapMemoryBudget(); }) {

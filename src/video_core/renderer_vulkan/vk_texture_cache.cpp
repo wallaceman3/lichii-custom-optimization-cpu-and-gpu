@@ -4498,8 +4498,12 @@ bool Image::ScaleUp(bool ignore) {
         scaled_info.size.width = scaled_width;
         scaled_info.size.height = scaled_height;
         scaled_image = MakeImage(runtime->device, runtime->memory_allocator, scaled_info,
-                                 runtime->ViewFormats(info.format));
+                                 runtime->ViewFormats(info.format), {}, false, false, true);
         ignore = false;
+        if (!scaled_image) {
+            current_image = &Image::original_image;
+            return false;
+        }
     }
     current_image = &Image::scaled_image;
     if (ignore) {
