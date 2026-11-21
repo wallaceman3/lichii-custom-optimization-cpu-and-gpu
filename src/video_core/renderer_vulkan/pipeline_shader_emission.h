@@ -36,7 +36,6 @@ inline std::vector<u32> EmitPipelineShader(const Shader::Profile& profile,
         routed_profile.route_single_candidates = true;
         used = &routed_profile;
     }
-    }
     std::vector<u32> code{
         Shader::Backend::SPIRV::EmitSPIRV(*used, runtime_info, program, binding)};
     if (!reference.empty() && !std::ranges::equal(code, reference)) {
