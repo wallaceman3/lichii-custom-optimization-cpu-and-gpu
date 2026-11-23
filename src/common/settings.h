@@ -216,6 +216,7 @@ struct Values {
                                                              Category::Core,
                                                              Specialization::Default,
                                                              true};
+    SwitchableSetting<bool> lazy_dram_commit{linkage, false, "lazy_dram_commit", Category::Core};
     SwitchableSetting<bool> use_speed_limit{
                                             linkage, true, "use_speed_limit", Category::Core, Specialization::Paired, true, true};
 
@@ -838,6 +839,15 @@ struct Values {
 
     SwitchableSetting<bool> gpu_unswizzle_enabled{linkage, false, "gpu_unswizzle_enabled",
                                                   Category::RendererHacks};
+
+    SwitchableSetting<bool> gpu_fast_acquire_eval{linkage, true, "gpu_fast_acquire_eval",
+                                                  Category::RendererHacks};
+
+    SwitchableSetting<bool> purge_stale_on_scene_change{linkage, true, "purge_stale_on_scene_change",
+                                                        Category::RendererHacks};
+
+    SwitchableSetting<bool> coalesce_pcie_readbacks{linkage, true, "coalesce_pcie_readbacks",
+                                                    Category::RendererHacks};
 
     SwitchableSetting<bool> pin_gpu_threads{linkage, true, "pin_gpu_threads",
                                             Category::RendererHacks};

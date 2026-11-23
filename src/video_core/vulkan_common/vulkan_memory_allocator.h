@@ -117,6 +117,19 @@ namespace Vulkan {
         /// aliased: its sparse blocks may share memory (VK_IMAGE_CREATE_SPARSE_ALIASED_BIT).
         vk::Image CreateUnbackedImage(const VkImageCreateInfo &ci, bool aliased = false) const;
 
+        /// Render target and storage images in their own VMA pool; false when it doesn't apply
+        /// or failed.
+        bool CreateImageInSeparatePool(const VkImageCreateInfo& ci,
+                                       const VmaAllocationCreateInfo& alloc_ci, VkImage& handle,
+                                       VmaAllocation& allocation,
+                                       VmaAllocationInfo& alloc_info) const;
+
+        /// Device-local buffers in their own VMA pool; false when it doesn't apply or failed.
+        bool CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, MemoryUsage usage,
+                                        const VmaAllocationCreateInfo& alloc_ci, VkBuffer& handle,
+                                        VmaAllocation& allocation,
+                                        VmaAllocationInfo& alloc_info) const;
+
         /// Device memory to bind to part of a sparse resource. Null when there is none left.
         VmaAllocation AllocateSparseMemory(const VkMemoryRequirements &requirements,
                                            VkDeviceMemory &memory, VkDeviceSize &offset) const;
@@ -185,11 +198,7 @@ namespace Vulkan {
         VkResult AllocateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
                                 VkDeviceSize min_alignment, vk::Buffer &buffer) const;
 
-        /// Device-local buffers in their own VMA pool; false when it doesn't apply or failed.
-        bool CreateBufferInSeparatePool(const VkBufferCreateInfo& ci,
-                                        const VmaAllocationCreateInfo& alloc_ci, VkBuffer& handle,
-                                        VmaAllocation& allocation,
-                                        VmaAllocationInfo& alloc_info) const;
+
 
         /// A device-local image or buffer that VMA quietly placed in host memory because the
         /// device heap was over its budget (VMA picks another memory type instead of failing).

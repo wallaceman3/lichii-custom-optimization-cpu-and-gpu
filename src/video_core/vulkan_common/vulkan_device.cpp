@@ -38,6 +38,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/shader_cache_v2/cache.h"
+#include "video_core/vram_target.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
 #endif
@@ -1089,17 +1090,17 @@ VideoCommon::Fsr4PortDevice Device::Fsr4PortDevice() const {
     };
 }
 
-VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
+VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type, bool create) const {
     std::scoped_lock lk{separate_pools_mutex};
     VmaPool& pool = separate_pools[static_cast<u32>(kind)][memory_type];
-    if (pool == VK_NULL_HANDLE) {
+    if (pool == VK_NULL_HANDLE && create) {
         const VmaPoolCreateInfo ci{
             .memoryTypeIndex = memory_type,
             .flags = 0,
             .blockSize = kind == SeparatePool::DeviceBuffers ? device_buffer_pool_block_size
                                                              : SeparatePoolBlockSize,
             .minBlockCount = 0,
-            .maxBlockCount = 0,
+            .maxBlockCount = kind == SeparatePool::RenderTargets ? 32u : 0u,
             .priority = 0.f,
             .minAllocationAlignment = 0,
             .pMemoryAllocateNext = nullptr,
@@ -2484,6 +2485,9 @@ u64 Device::GetDeviceMemoryBudget() const {
         // gives it (4 GiB, 6 GiB with aggressive VRAM use).
         result = (std::min)(result, device_access_memory);
     }
+    if (vram_target != 0) {
+        result = (std::min)(result, vram_target);
+    }
     return result;
 }
 
@@ -2588,6 +2592,9 @@ void Device::CollectPhysicalMemoryInfo() {
             const size_t scaler_memory = 1_GiB * Settings::values.resolution_info.ScaleUp(1);
             device_access_memory = std::min<u64>(device_access_memory, normal_memory + scaler_memory);
         }
+    }
+    if (vram_target != 0) {
+        device_access_memory = (std::min)(device_access_memory, vram_target);
     }
 }
 

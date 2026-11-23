@@ -318,6 +318,15 @@ void DeviceMemoryManager<Traits>::HintCold(DAddr address, size_t size) {
 }
 
 template <typename Traits>
+void DeviceMemoryManager<Traits>::TrimZeroPages() const {
+#ifdef _WIN32
+    if (device_memory_ptr) {
+        device_memory_ptr->buffer.TrimZeroPages();
+    }
+#endif
+}
+
+template <typename Traits>
 void DeviceMemoryManager<Traits>::BindInterface(DeviceInterface* device_inter_) {
     device_inter = device_inter_;
 }

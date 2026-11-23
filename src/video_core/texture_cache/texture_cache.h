@@ -2790,6 +2790,9 @@ void TextureCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t siz
         }
         image.flags |= ImageFlagBits::Remapped;
     }
+    if (size >= 32_MiB || deleted_images.size() >= 8) {
+        PurgeStaleImagesOnSceneChange();
+    }
 }
 
 // A 2D-engine copy between two 3D surfaces names one depth slice by its address inside the

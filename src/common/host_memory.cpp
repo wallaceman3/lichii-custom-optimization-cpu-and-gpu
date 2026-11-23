@@ -67,6 +67,7 @@
 #include "common/free_region_manager.h"
 #include "common/host_memory.h"
 #include "common/logging.h"
+#include "common/settings.h"
 
 #if defined(__ANDROID__) && __ANDROID_API__ < 30
 #include <sys/syscall.h>
@@ -166,11 +167,13 @@ public:
         // ERROR_NO_SYSTEM_RESOURCES without growing a system-managed page file. The emulator then
         // runs the whole session without fastmem (Ocarina of Time: 20-25% fewer fps). A private
         // commit of the same size does grow the page file, so make one, release it and try again.
+lazy_commit = Settings::values.lazy_dram_commit.GetValue();
+        const ULONG alloc_attr = lazy_commit ? SEC_RESERVE : SEC_COMMIT;
         for (int attempt = 1; attempt <= BackingAttempts && !backing_handle; ++attempt) {
-            backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);
+            backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, alloc_attr, backing_size, nullptr, nullptr, 0);
             if (backing_handle) {
-                if (attempt > 1) {
-                    LOG_INFO(HW_Memory, "Allocated {} MiB of backing memory on attempt {}", backing_size >> 20, attempt);
+                if (attempt > 1 || lazy_commit) {
+                    LOG_INFO(HW_Memory, "Allocated {} MiB of backing memory on attempt {} (lazy={})", backing_size >> 20, attempt, lazy_commit);
                 }
                 break;
             }
@@ -1341,6 +1344,11 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
     if (length == 0) {
         return;
     }
+#ifdef _WIN32
+    if (Settings::values.lazy_dram_commit.GetValue() && backing_base) {
+        VirtualAlloc(backing_base + physical_offset, length, MEM_COMMIT, PAGE_READWRITE);
+    }
+#endif
     MarkUsed(physical_offset, length);
     if (fill_value != 0) {
         std::memset(backing_base + physical_offset, fill_value, length);
