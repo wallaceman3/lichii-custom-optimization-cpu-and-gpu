@@ -103,17 +103,6 @@ using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GuessMissing;
 using VideoCommon::GraphicsEnvironment;
-using PipelineCache::boot_ps_spirv_hashes;
-using PipelineCache::boot_vs_spirv_hashes;
-using PipelineCache::parity_mutex;
-using PipelineCache::parity_ps_hits;
-using PipelineCache::parity_ps_mismatch;
-using PipelineCache::parity_ps_not_in_boot;
-using PipelineCache::parity_seen_ps;
-using PipelineCache::parity_seen_vs;
-using PipelineCache::parity_vs_hits;
-using PipelineCache::parity_vs_mismatch;
-using PipelineCache::parity_vs_not_in_boot;
 
 constexpr u32 CACHE_VERSION = VideoCommon::VulkanPipelineCacheVersion;
 const size_t VULKAN_CACHE_FLUSH_PIPELINES = []() -> size_t {
@@ -1109,7 +1098,12 @@ void PipelineCache::RecordSpirvParity(bool is_precache, size_t stage_index, u64 
                            it->second.end()) {
                     parity_vs_hits.fetch_add(1, std::memory_order_relaxed);
                 } else {
-                    parity_vs_mismatch.fetch_add(1, std::memory_order_relaxed);
+                    const u32 mismatch_count = parity_vs_mismatch.fetch_add(1, std::memory_order_relaxed);
+                    if (mismatch_count < 5) {
+                        LOG_INFO(Render_Vulkan,
+                                 "[PARITY VS MISMATCH #{}] Hash {:016x} RuntimeSpirvHash: {:016x} (Words: {}) BootVariantsCount: {}",
+                                 mismatch_count, shader_hash, spirv_hash, spirv.size(), it->second.size());
+                    }
                 }
             }
         } else {
@@ -1121,7 +1115,12 @@ void PipelineCache::RecordSpirvParity(bool is_precache, size_t stage_index, u64 
                            it->second.end()) {
                     parity_ps_hits.fetch_add(1, std::memory_order_relaxed);
                 } else {
-                    parity_ps_mismatch.fetch_add(1, std::memory_order_relaxed);
+                    const u32 mismatch_count = parity_ps_mismatch.fetch_add(1, std::memory_order_relaxed);
+                    if (mismatch_count < 5) {
+                        LOG_INFO(Render_Vulkan,
+                                 "[PARITY PS MISMATCH #{}] Hash {:016x} RuntimeSpirvHash: {:016x} (Words: {}) BootVariantsCount: {}",
+                                 mismatch_count, shader_hash, spirv_hash, spirv.size(), it->second.size());
+                    }
                 }
             }
         }
@@ -2581,6 +2580,16 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
                 key.state.color_write_enable_dynamic.Assign(dynamic_features.has_color_write_enable ? 1 : 0);
                 key.state.topology.Assign(Maxwell::PrimitiveTopology::Triangles);
                 key.state.color_formats[0] = static_cast<u8>(Tegra::RenderTargetFormat::A8B8G8R8_UNORM);
+                key.state.ndc_minus_one_to_one.Assign(1);
+                key.state.alpha_test_func.Assign(
+                    FixedPipelineState::PackComparisonOp(Maxwell::ComparisonOp::Always_GL));
+                if (dynamic_features.has_dynamic_vertex_input) {
+                    u64 attr_types = 0;
+                    for (size_t a = 0; a < 16; ++a) {
+                        attr_types |= (u64{1} << (a * 2));
+                    }
+                    key.state.attribute_types = attr_types;
+                }
 
                 if (!wait_for_slot()) {
                     break;
@@ -3960,20 +3969,20 @@ void ReportRuntimePipeline(RuntimeBuild kind, std::chrono::steady_clock::duratio
     size_t boot_vs_size = 0;
     size_t boot_ps_size = 0;
     {
-        std::scoped_lock lock{parity_mutex};
-        boot_vs_size = boot_vs_spirv_hashes.size();
-        boot_ps_size = boot_ps_spirv_hashes.size();
+        std::scoped_lock lock{PipelineCache::parity_mutex};
+        boot_vs_size = PipelineCache::boot_vs_spirv_hashes.size();
+        boot_ps_size = PipelineCache::boot_ps_spirv_hashes.size();
     }
     LOG_INFO(Render_Vulkan,
              "[PARITY] BootMap(VS={}, PS={}) | VS: {} hit / {} mismatch / {} not_in_boot | "
              "PS: {} hit / {} mismatch / {} not_in_boot",
              boot_vs_size, boot_ps_size,
-             parity_vs_hits.load(std::memory_order_relaxed),
-             parity_vs_mismatch.load(std::memory_order_relaxed),
-             parity_vs_not_in_boot.load(std::memory_order_relaxed),
-             parity_ps_hits.load(std::memory_order_relaxed),
-             parity_ps_mismatch.load(std::memory_order_relaxed),
-             parity_ps_not_in_boot.load(std::memory_order_relaxed));
+             PipelineCache::parity_vs_hits.load(std::memory_order_relaxed),
+             PipelineCache::parity_vs_mismatch.load(std::memory_order_relaxed),
+             PipelineCache::parity_vs_not_in_boot.load(std::memory_order_relaxed),
+             PipelineCache::parity_ps_hits.load(std::memory_order_relaxed),
+             PipelineCache::parity_ps_mismatch.load(std::memory_order_relaxed),
+             PipelineCache::parity_ps_not_in_boot.load(std::memory_order_relaxed));
     builds.window = {};
     builds.translation_wait = {};
     builds.stage_translation = {};
@@ -3998,20 +4007,20 @@ void LogRuntimePipelineTotals() {
         size_t boot_vs_size = 0;
         size_t boot_ps_size = 0;
         {
-            std::scoped_lock lock{parity_mutex};
-            boot_vs_size = boot_vs_spirv_hashes.size();
-            boot_ps_size = boot_ps_spirv_hashes.size();
+            std::scoped_lock lock{PipelineCache::parity_mutex};
+            boot_vs_size = PipelineCache::boot_vs_spirv_hashes.size();
+            boot_ps_size = PipelineCache::boot_ps_spirv_hashes.size();
         }
         LOG_INFO(Render_Vulkan,
                  "[PARITY Final] BootMap(VS={}, PS={}) | VS: {} hit / {} mismatch / {} not_in_boot | "
                  "PS: {} hit / {} mismatch / {} not_in_boot",
                  boot_vs_size, boot_ps_size,
-                 parity_vs_hits.load(std::memory_order_relaxed),
-                 parity_vs_mismatch.load(std::memory_order_relaxed),
-                 parity_vs_not_in_boot.load(std::memory_order_relaxed),
-                 parity_ps_hits.load(std::memory_order_relaxed),
-                 parity_ps_mismatch.load(std::memory_order_relaxed),
-                 parity_ps_not_in_boot.load(std::memory_order_relaxed));
+                 PipelineCache::parity_vs_hits.load(std::memory_order_relaxed),
+                 PipelineCache::parity_vs_mismatch.load(std::memory_order_relaxed),
+                 PipelineCache::parity_vs_not_in_boot.load(std::memory_order_relaxed),
+                 PipelineCache::parity_ps_hits.load(std::memory_order_relaxed),
+                 PipelineCache::parity_ps_mismatch.load(std::memory_order_relaxed),
+                 PipelineCache::parity_ps_not_in_boot.load(std::memory_order_relaxed));
     }
     builds.window = {};
     builds.session = {};
