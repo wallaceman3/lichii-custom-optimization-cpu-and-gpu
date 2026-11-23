@@ -504,7 +504,7 @@ bool MemoryAllocator::CreateBufferInSeparatePool(const VkBufferCreateInfo& ci, M
                                                  VmaAllocationInfo& alloc_info) const {
     // The buffer cache's buffers, churned by its collector: in a pool of their own (see
     // Device::SeparatePool). Anything over half a block takes the default blocks (dedicated).
-    if (usage != MemoryUsage::DeviceLocal || ci.size > Device::DeviceBufferBlockSize / 2) {
+    if (usage != MemoryUsage::DeviceLocal || ci.size > device.GetDeviceBufferPoolBlockSize() / 2) {
         return false;
     }
     u32 memory_type{};
