@@ -82,10 +82,8 @@ public:
 
 class ArmDynarmic64 final : public ArmInterface {
 public:
-    /// `shared_code_cache`: the process's cores share one JIT code cache, where supported.
     ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process,
-                  DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index,
-                  std::shared_ptr<Dynarmic::A64::SharedCodeCache> shared_code_cache = {});
+                  DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index);
     ~ArmDynarmic64() override;
 
     Architecture GetArchitecture() const override {
@@ -121,7 +119,6 @@ private:
     void MakeJit(Common::PageTable* page_table, std::size_t address_space_bits);
     std::optional<DynarmicCallbacks64> m_cb{};
     std::size_t m_core_index{};
-    std::shared_ptr<Dynarmic::A64::SharedCodeCache> m_shared_code_cache;
 
     std::optional<Dynarmic::A64::Jit> m_jit{};
 

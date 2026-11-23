@@ -565,14 +565,6 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         // address: the CPU's return predictor predicts guest returns instead of one shared
         // indirect jump through the return stack buffer (multicore only, no cycle counter).
         config.host_call_return = !config.enable_cycle_counting;
-        // One code cache for all cores of the process: a block is compiled once, not per core
-        // (72-74% of the six caches' code was duplicated in Ocarina of Time). 1 GiB of address
-        // space, committed as used.
-        if (m_shared_code_cache && config.host_call_return && page_table &&
-            !config.check_halt_on_memory_access) {
-            config.shared_code_cache = m_shared_code_cache;
-            config.code_cache_size = std::uint32_t(1_GiB);
-        }
     }
 #endif
     m_jit.emplace(config);
@@ -639,11 +631,10 @@ void ArmDynarmic64::RewindBreakpointInstruction() {
     this->SetContext(m_breakpoint_context);
 }
 
-ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index, std::shared_ptr<Dynarmic::A64::SharedCodeCache> shared_code_cache)
+ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index)
     : ArmInterface{uses_wall_clock}, m_system{system}, m_exclusive_monitor{exclusive_monitor}
     , m_cb(std::in_place, *this, process)
     , m_core_index{core_index}
-    , m_shared_code_cache{std::move(shared_code_cache)}
 {
     auto& page_table = process->GetPageTable().GetBasePageTable();
     auto& page_table_impl = page_table.GetImpl();
