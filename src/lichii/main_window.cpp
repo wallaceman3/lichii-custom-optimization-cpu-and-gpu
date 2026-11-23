@@ -5459,7 +5459,6 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         LOG_INFO(Frontend, "Shader precache: skipping offline pre-warm for Switch 1 title {:016x}", title_id);
         return;
     }
-    const auto warm_file = ShaderWarm::ComputeWarmPath(title_id);
     const auto pairs_file = ShaderWarm::PairsWarmPath(title_id);
     const auto stale = ShaderWarm::WarmFilesStale(warm_file);
     const auto pairs_stale = ShaderWarm::WarmFilesStale(pairs_file);
