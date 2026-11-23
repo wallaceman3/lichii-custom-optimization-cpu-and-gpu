@@ -103,17 +103,6 @@ using VideoCommon::FileEnvironment;
 using VideoCommon::GenericEnvironment;
 using VideoCommon::GuessMissing;
 using VideoCommon::GraphicsEnvironment;
-using PipelineCache::boot_ps_spirv_hashes;
-using PipelineCache::boot_vs_spirv_hashes;
-using PipelineCache::parity_mutex;
-using PipelineCache::parity_ps_hits;
-using PipelineCache::parity_ps_mismatch;
-using PipelineCache::parity_ps_not_in_boot;
-using PipelineCache::parity_seen_ps;
-using PipelineCache::parity_seen_vs;
-using PipelineCache::parity_vs_hits;
-using PipelineCache::parity_vs_mismatch;
-using PipelineCache::parity_vs_not_in_boot;
 
 constexpr u32 CACHE_VERSION = VideoCommon::VulkanPipelineCacheVersion;
 const size_t VULKAN_CACHE_FLUSH_PIPELINES = []() -> size_t {
@@ -3960,20 +3949,20 @@ void ReportRuntimePipeline(RuntimeBuild kind, std::chrono::steady_clock::duratio
     size_t boot_vs_size = 0;
     size_t boot_ps_size = 0;
     {
-        std::scoped_lock lock{parity_mutex};
-        boot_vs_size = boot_vs_spirv_hashes.size();
-        boot_ps_size = boot_ps_spirv_hashes.size();
+        std::scoped_lock lock{PipelineCache::parity_mutex};
+        boot_vs_size = PipelineCache::boot_vs_spirv_hashes.size();
+        boot_ps_size = PipelineCache::boot_ps_spirv_hashes.size();
     }
     LOG_INFO(Render_Vulkan,
              "[PARITY] BootMap(VS={}, PS={}) | VS: {} hit / {} mismatch / {} not_in_boot | "
              "PS: {} hit / {} mismatch / {} not_in_boot",
              boot_vs_size, boot_ps_size,
-             parity_vs_hits.load(std::memory_order_relaxed),
-             parity_vs_mismatch.load(std::memory_order_relaxed),
-             parity_vs_not_in_boot.load(std::memory_order_relaxed),
-             parity_ps_hits.load(std::memory_order_relaxed),
-             parity_ps_mismatch.load(std::memory_order_relaxed),
-             parity_ps_not_in_boot.load(std::memory_order_relaxed));
+             PipelineCache::parity_vs_hits.load(std::memory_order_relaxed),
+             PipelineCache::parity_vs_mismatch.load(std::memory_order_relaxed),
+             PipelineCache::parity_vs_not_in_boot.load(std::memory_order_relaxed),
+             PipelineCache::parity_ps_hits.load(std::memory_order_relaxed),
+             PipelineCache::parity_ps_mismatch.load(std::memory_order_relaxed),
+             PipelineCache::parity_ps_not_in_boot.load(std::memory_order_relaxed));
     builds.window = {};
     builds.translation_wait = {};
     builds.stage_translation = {};
@@ -3998,20 +3987,20 @@ void LogRuntimePipelineTotals() {
         size_t boot_vs_size = 0;
         size_t boot_ps_size = 0;
         {
-            std::scoped_lock lock{parity_mutex};
-            boot_vs_size = boot_vs_spirv_hashes.size();
-            boot_ps_size = boot_ps_spirv_hashes.size();
+            std::scoped_lock lock{PipelineCache::parity_mutex};
+            boot_vs_size = PipelineCache::boot_vs_spirv_hashes.size();
+            boot_ps_size = PipelineCache::boot_ps_spirv_hashes.size();
         }
         LOG_INFO(Render_Vulkan,
                  "[PARITY Final] BootMap(VS={}, PS={}) | VS: {} hit / {} mismatch / {} not_in_boot | "
                  "PS: {} hit / {} mismatch / {} not_in_boot",
                  boot_vs_size, boot_ps_size,
-                 parity_vs_hits.load(std::memory_order_relaxed),
-                 parity_vs_mismatch.load(std::memory_order_relaxed),
-                 parity_vs_not_in_boot.load(std::memory_order_relaxed),
-                 parity_ps_hits.load(std::memory_order_relaxed),
-                 parity_ps_mismatch.load(std::memory_order_relaxed),
-                 parity_ps_not_in_boot.load(std::memory_order_relaxed));
+                 PipelineCache::parity_vs_hits.load(std::memory_order_relaxed),
+                 PipelineCache::parity_vs_mismatch.load(std::memory_order_relaxed),
+                 PipelineCache::parity_vs_not_in_boot.load(std::memory_order_relaxed),
+                 PipelineCache::parity_ps_hits.load(std::memory_order_relaxed),
+                 PipelineCache::parity_ps_mismatch.load(std::memory_order_relaxed),
+                 PipelineCache::parity_ps_not_in_boot.load(std::memory_order_relaxed));
     }
     builds.window = {};
     builds.session = {};
