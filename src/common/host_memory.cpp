@@ -167,7 +167,7 @@ public:
         // ERROR_NO_SYSTEM_RESOURCES without growing a system-managed page file. The emulator then
         // runs the whole session without fastmem (Ocarina of Time: 20-25% fewer fps). A private
         // commit of the same size does grow the page file, so make one, release it and try again.
-lazy_commit = Settings::values.lazy_dram_commit.GetValue();
+        const bool lazy_commit = Settings::values.lazy_dram_commit.GetValue();
         const ULONG alloc_attr = lazy_commit ? SEC_RESERVE : SEC_COMMIT;
         for (int attempt = 1; attempt <= BackingAttempts && !backing_handle; ++attempt) {
             backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, alloc_attr, backing_size, nullptr, nullptr, 0);
