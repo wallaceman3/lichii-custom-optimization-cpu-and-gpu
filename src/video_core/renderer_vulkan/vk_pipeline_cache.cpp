@@ -1098,7 +1098,12 @@ void PipelineCache::RecordSpirvParity(bool is_precache, size_t stage_index, u64 
                            it->second.end()) {
                     parity_vs_hits.fetch_add(1, std::memory_order_relaxed);
                 } else {
-                    parity_vs_mismatch.fetch_add(1, std::memory_order_relaxed);
+                    const u32 mismatch_count = parity_vs_mismatch.fetch_add(1, std::memory_order_relaxed);
+                    if (mismatch_count < 5) {
+                        LOG_INFO(Render_Vulkan,
+                                 "[PARITY VS MISMATCH #{}] Hash {:016x} RuntimeSpirvHash: {:016x} (Words: {}) BootVariantsCount: {}",
+                                 mismatch_count, shader_hash, spirv_hash, spirv.size(), it->second.size());
+                    }
                 }
             }
         } else {
@@ -1110,7 +1115,12 @@ void PipelineCache::RecordSpirvParity(bool is_precache, size_t stage_index, u64 
                            it->second.end()) {
                     parity_ps_hits.fetch_add(1, std::memory_order_relaxed);
                 } else {
-                    parity_ps_mismatch.fetch_add(1, std::memory_order_relaxed);
+                    const u32 mismatch_count = parity_ps_mismatch.fetch_add(1, std::memory_order_relaxed);
+                    if (mismatch_count < 5) {
+                        LOG_INFO(Render_Vulkan,
+                                 "[PARITY PS MISMATCH #{}] Hash {:016x} RuntimeSpirvHash: {:016x} (Words: {}) BootVariantsCount: {}",
+                                 mismatch_count, shader_hash, spirv_hash, spirv.size(), it->second.size());
+                    }
                 }
             }
         }
@@ -2570,6 +2580,16 @@ void PipelineCache::PrecacheShaders(u64 title_id, std::stop_token stop_loading,
                 key.state.color_write_enable_dynamic.Assign(dynamic_features.has_color_write_enable ? 1 : 0);
                 key.state.topology.Assign(Maxwell::PrimitiveTopology::Triangles);
                 key.state.color_formats[0] = static_cast<u8>(Tegra::RenderTargetFormat::A8B8G8R8_UNORM);
+                key.state.ndc_minus_one_to_one.Assign(1);
+                key.state.alpha_test_func.Assign(
+                    FixedPipelineState::PackComparisonOp(Maxwell::ComparisonOp::Always_GL));
+                if (dynamic_features.has_dynamic_vertex_input) {
+                    u64 attr_types = 0;
+                    for (size_t a = 0; a < 16; ++a) {
+                        attr_types |= (u64{1} << (a * 2));
+                    }
+                    key.state.attribute_types = attr_types;
+                }
 
                 if (!wait_for_slot()) {
                     break;
