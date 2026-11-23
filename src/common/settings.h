@@ -217,6 +217,7 @@ struct Values {
                                                              Specialization::Default,
                                                              true};
     SwitchableSetting<bool> lazy_dram_commit{linkage, false, "lazy_dram_commit", Category::Core};
+    SwitchableSetting<bool> render_follower{linkage, false, "render_follower", Category::RendererHacks};
     SwitchableSetting<bool> use_speed_limit{
                                             linkage, true, "use_speed_limit", Category::Core, Specialization::Paired, true, true};
 

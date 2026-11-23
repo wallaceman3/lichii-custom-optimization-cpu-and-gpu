@@ -3090,6 +3090,11 @@ u64 TextureCacheRuntime::GetDeviceHeapMemoryBudget() const {
     return device.GetDeviceHeapMemoryBudget();
 }
 
+u64 TextureCacheRuntime::GetVramTarget() const noexcept {
+    const u64 vram_target = device.GetVramTarget();
+    return vram_target;
+}
+
 u64 TextureCacheRuntime::GetDeviceMemorySlack() const {
     return device.GetDeviceMemorySlack();
 }

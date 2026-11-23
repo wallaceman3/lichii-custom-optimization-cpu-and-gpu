@@ -146,4 +146,33 @@ std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& c
     return out;
 }
 
+std::vector<u8> GraphicsPairEntry(const LoweredCode& vs_lowered, const LoweredCode& ps_lowered,
+                                  u64 vs_hash, u64 ps_hash) {
+    std::vector<u8> out;
+    out.reserve(4 + 2 * (EnvHeaderSize + sizeof(Shader::ProgramHeader)) +
+                vs_lowered.code.size() + ps_lowered.code.size() + 6 * 8);
+    Put<u32>(out, 2);
+    const u32 vs_texture_bound = vs_lowered.texture_buffer != ~0U ? vs_lowered.texture_buffer : 0;
+    const u32 vs_local_size = static_cast<u32>(vs_lowered.sph.LocalMemorySize()) +
+                              vs_lowered.sph.common3.shader_local_memory_crs_size;
+    PutEnvHeader(out, vs_lowered.code.size(), 0, vs_local_size, vs_texture_bound, 0, 0); // Stage 0: VertexB
+    PutBytes(out, vs_lowered.code);
+    PutBytes(out, std::span<const u8>(reinterpret_cast<const u8*>(&vs_lowered.sph), sizeof(vs_lowered.sph)));
+
+    const u32 ps_texture_bound = ps_lowered.texture_buffer != ~0U ? ps_lowered.texture_buffer : 0;
+    const u32 ps_local_size = static_cast<u32>(ps_lowered.sph.LocalMemorySize()) +
+                              ps_lowered.sph.common3.shader_local_memory_crs_size;
+    PutEnvHeader(out, ps_lowered.code.size(), 0, ps_local_size, ps_texture_bound, 0, 4); // Stage 4: Fragment
+    PutBytes(out, ps_lowered.code);
+    PutBytes(out, std::span<const u8>(reinterpret_cast<const u8*>(&ps_lowered.sph), sizeof(ps_lowered.sph)));
+
+    std::array<u64, 6> hashes{};
+    hashes[1] = vs_hash;
+    hashes[5] = ps_hash;
+    for (const u64 h : hashes) {
+        Put<u64>(out, h);
+    }
+    return out;
+}
+
 } // namespace VideoCommon::ShaderWarm

@@ -9,10 +9,12 @@
 #include <optional>
 #include <stop_token>
 #include <string>
+
 #include <unordered_set>
 
 #include "common/common_types.h"
 #include "common/settings_enums.h"
+#include "video_core/shader_warm/warm_records.h"
 
 namespace Core {
 class System;
@@ -24,6 +26,9 @@ namespace VideoCommon::ShaderWarm {
 /// (<shader dir>/<title id>/warm-compute.bin). It holds the compute programs found in the game
 /// files, in pipeline cache format with no recorded reads.
 std::filesystem::path ComputeWarmPath(u64 title_id);
+
+/// Where the graphics shader variation pairs file lives (<shader dir>/<title id>/warm-pairs.bin).
+std::filesystem::path PairsWarmPath(u64 title_id);
 
 /// "Already precached" marker of a precache file (same folder, extension .done), written by the
 /// emulator after the precache ran to the end. A matching marker skips the precache at boot.
@@ -134,9 +139,8 @@ bool TakeWarmBeforeStart();
 void RequestSkipWarm();
 bool TakeSkipWarm();
 
-/// Removes the title's precache file, its marker, count, progress and request, the list of
-/// precached graphics pipelines older builds kept and a leftover temporary file (rebuild or
-/// delete from the UI). Returns false when a file exists but cannot be removed, with
+/// Removes the title's precache file, its marker and count, the list of precached graphics
+/// pipelines older builds kept and a leftover temporary file (rebuild or delete from the UI). Returns false when a file exists but cannot be removed, with
 /// the reason in `error` when given.
 bool DeleteWarmFiles(u64 title_id, std::string* error = nullptr);
 
@@ -150,8 +154,8 @@ struct Result {
     bool ok{};
     std::string error;           ///< Empty when ok
     size_t archives{};           ///< Shader archives found in the game files
-    size_t packs{};              ///< Asset packs scanned for zstd frames (IsFramePack)
     size_t compute_programs{};   ///< Entries written to the precache file
+    size_t graphics_programs{};  ///< Programs written to shader cache v2
     size_t skipped{};            ///< Programs that failed to extract or convert
 };
 
@@ -171,7 +175,7 @@ Result BuildWarmFiles(Core::System& system, const std::filesystem::path& game_pa
 struct BuildOptions {
     /// Folder for warm-compute.bin; empty: <shader dir>/<title id>.
     std::filesystem::path output_dir;
-    /// Conversion threads, 0: every CPU thread.
+    /// Conversion threads, 0: a quarter of the CPU threads, 2 to 6.
     size_t threads{};
 };
 

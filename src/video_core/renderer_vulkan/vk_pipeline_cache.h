@@ -17,6 +17,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <type_traits>
 #include "common/container/unordered_map.h"
@@ -130,6 +131,21 @@ struct ComputePipelineCacheEntry {
 
 class PipelineCache : public VideoCommon::ShaderCache {
 public:
+    inline static std::mutex parity_mutex;
+    inline static std::unordered_map<u64, std::vector<u64>> boot_vs_spirv_hashes;
+    inline static std::unordered_map<u64, std::vector<u64>> boot_ps_spirv_hashes;
+    inline static std::unordered_set<u64> parity_seen_vs;
+    inline static std::unordered_set<u64> parity_seen_ps;
+    inline static std::atomic<size_t> parity_vs_hits{0};
+    inline static std::atomic<size_t> parity_vs_mismatch{0};
+    inline static std::atomic<size_t> parity_vs_not_in_boot{0};
+    inline static std::atomic<size_t> parity_ps_hits{0};
+    inline static std::atomic<size_t> parity_ps_mismatch{0};
+    inline static std::atomic<size_t> parity_ps_not_in_boot{0};
+
+    static void RecordSpirvParity(bool is_precache, size_t stage_index, u64 shader_hash,
+                                  std::span<const u32> spirv);
+
     explicit PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_, const Device& device,
                            Scheduler& scheduler, DescriptorPool& descriptor_pool,
                            GuestDescriptorQueue& guest_descriptor_queue,
@@ -219,7 +235,7 @@ private:
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
         bool build_in_parallel, std::shared_ptr<ShaderPools> emit_pools = nullptr,
-        ParallelTranslation* parallel = nullptr);
+        ParallelTranslation* parallel = nullptr, bool is_precache = false);
 
     /// Released IR pools for a build, or new ones
     [[nodiscard]] std::shared_ptr<ShaderPools> TakeSparePools();

@@ -5451,9 +5451,20 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         !Settings::values.use_disk_shader_cache.GetValue()) {
         return;
     }
+    // Only pre-warm offline shaders for Switch 2 (or Switch 2 upgraded) titles.
+    // Pure Switch 1 titles use the native JIT Maxwell pipeline directly.
+    const bool is_switch2 = ((title_id & 0xFF00000000000000ULL) == 0x0400000000000000ULL) ||
+                            Settings::CurrentProgramIsSwitch2();
+    if (!is_switch2) {
+        LOG_INFO(Frontend, "Shader precache: skipping offline pre-warm for Switch 1 title {:016x}", title_id);
+        return;
+    }
+    const auto warm_file = ShaderWarm::ComputeWarmPath(title_id);
+    const auto pairs_file = ShaderWarm::PairsWarmPath(title_id);
     const auto stale = ShaderWarm::WarmFilesStale(warm_file);
+    const auto pairs_stale = ShaderWarm::WarmFilesStale(pairs_file);
     const bool pending = ShaderWarm::WarmPending(title_id);
-    if (!pending && !stale) {
+    if (!pending && !stale && !pairs_stale) {
         // Precached before: the renderer runs it again only when the driver or the file changed.
         ShaderWarm::RequestWarmBeforeStart(true);
         return;
@@ -5479,8 +5490,9 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         }
     }
     std::error_code ec;
-    if (stale) {
-        LOG_INFO(Frontend, "Shader precache for {:016x}: {}, building it", title_id, *stale);
+    if (stale || pairs_stale) {
+        LOG_INFO(Frontend, "Shader precache for {:016x}: compute {}, pairs {}, building it",
+                 title_id, stale ? *stale : "current", pairs_stale ? *pairs_stale : "current");
         ShaderWarmDialog dialog(*QtCommon::system, game_path, title_id,
                                 GameTitleName(Common::FS::PathToUTF8String(game_path)), this);
         connect(&dialog, &ShaderWarmDialog::BuildFinished, &dialog, [&dialog](bool ok) {
@@ -5490,7 +5502,7 @@ void MainWindow::PrepareShaderPrecache(u64 title_id, const std::filesystem::path
         });
         dialog.Start();
         dialog.exec();
-        if (!std::filesystem::exists(warm_file, ec)) {
+        if (!std::filesystem::exists(warm_file, ec) && !std::filesystem::exists(pairs_file, ec)) {
             return;
         }
     }

@@ -3534,7 +3534,7 @@ private:
     };
 
     static constexpr u32 NoSyncpoint = ~0U;
-    static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
+    static constexpr size_t MaxDecodedAhead = 5; // decoded frames buffered ahead to absorb software decode jitter
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
     static constexpr u32 MaxDroppedInARow = 30; // see DropOvertakenFrames
     // A client holding more output images than this queues frames and shows each at its own

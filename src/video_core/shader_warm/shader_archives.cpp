@@ -7,7 +7,6 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <memory>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -15,7 +14,6 @@
 #include <fmt/format.h>
 #include <zlib.h>
 #include <zstd.h>
-#include <zstd_errors.h>
 
 #include "video_core/shader_warm/shader_archives.h"
 
@@ -420,7 +418,7 @@ Record GraphicsRecord(Bytes code, Bytes control) {
 
 /// Every stage program of every variation in a BNSH file, task and mesh included. Throws when the
 /// version, layout or a stage's header does not check out.
-std::vector<Record> ParseBnsh(Bytes data) {
+std::vector<Record> ParseBnsh(Bytes data, const std::function<void(const ShaderPairRecord&)>* on_pair = nullptr) {
     Extent(data, 0, 0x98);
     if (!Is(data, 0, std::string_view{"BNSH\0\0\0\0", 8}) || !Is(data, 0x60, "grsc")) {
         throw ArchiveError("invalid BNSH header");
@@ -461,6 +459,8 @@ std::vector<Record> ParseBnsh(Bytes data) {
             slots.emplace_back(0x40, ProgramStage::Task);
             slots.emplace_back(0x48, ProgramStage::Mesh);
         }
+        std::optional<Record> vs_rec;
+        std::optional<Record> ps_rec;
         for (size_t index = 0; index < slots.size(); ++index) {
             const auto [slot, stage] = slots[index];
             const u64 record = Le<u64>(data, program + slot);
@@ -495,7 +495,19 @@ std::vector<Record> ParseBnsh(Bytes data) {
                     throw ArchiveError("BNSH graphics stage disagrees with native header");
                 }
             }
-            result.push_back({stage, code, control});
+            Record rec{stage, code, control};
+            if (stage == ProgramStage::Vertex) {
+                vs_rec = rec;
+            } else if (stage == ProgramStage::Fragment) {
+                ps_rec = rec;
+            }
+            result.push_back(rec);
+        }
+        if (vs_rec && ps_rec && on_pair && *on_pair) {
+            (*on_pair)(ShaderPairRecord{
+                .vs = ShaderRecord{vs_rec->stage, vs_rec->code, vs_rec->control},
+                .ps = ShaderRecord{ps_rec->stage, ps_rec->code, ps_rec->control},
+            });
         }
     }
     return result;
@@ -774,6 +786,7 @@ std::vector<Record> ParseBahs(Bytes data) {
 struct Walker {
     const ZstdDictionaries* dictionaries;
     const std::function<void(const ShaderRecord&)>& on_record;
+    const std::function<void(const ShaderPairRecord&)>* on_pair{nullptr};
     const std::function<void(const std::string&)>& on_member_error;
 
     /// Passes every record to the caller's record callback.
@@ -829,7 +842,7 @@ struct Walker {
                 }
             }
         } else if (Is(data, 0, "BNSH")) {
-            Emit(ParseBnsh(data));
+            Emit(ParseBnsh(data, on_pair));
         } else if (Is(data, 0, "CGSB")) {
             Emit(ParseCgsb(data));
         } else if (Is(data, 0, "SHN!")) {
@@ -921,6 +934,12 @@ GameFileKind ClassifyGameFile(std::string_view path) {
     if (EndsWith(lower, ".ptcl")) {
         return GameFileKind::Effect;
     }
+    for (const std::string_view extension :
+         {".pak", ".bundle", ".cpk", ".bin", ".data", ".shaders", ".archive", ".ucas"}) {
+        if (EndsWith(lower, extension)) {
+            return GameFileKind::GenericPackage;
+        }
+    }
     return GameFileKind::Other;
 }
 
@@ -928,261 +947,17 @@ void WalkArchive(std::span<const u8> data, const std::string& name,
                  const ZstdDictionaries* dictionaries,
                  const std::function<void(const ShaderRecord&)>& on_record,
                  const std::function<void(const std::string&)>& on_member_error) {
-    const Walker walker{dictionaries, on_record, on_member_error};
+    const Walker walker{dictionaries, on_record, nullptr, on_member_error};
     walker.Walk(data, name, 0);
 }
 
-// ---------------------------------------------------------------------------------------------
-// Asset packs: bare programs in zstd frames (Kirby Air Riders). The readers follow Zachary
-// McKenney's #1117 (40dadda7d5, b57bfc0457).
-
-namespace {
-
-constexpr std::array<u8, 4> ZstdMagic{0x28, 0xb5, 0x2f, 0xfd};
-constexpr size_t BareControlBytes = 0x48;
-/// A frame's header and checksum past the compressed size of its content
-constexpr u64 MaxFrameOverhead = 22;
-
-/// Compute, task and mesh by the control section's stage byte (+0x56), graphics stages by the
-/// program header at the code's start.
-std::optional<ProgramStage> BareStage(Bytes control, Bytes code) {
-    if (control.size() > 0x56) {
-        switch (control[0x56]) {
-        case 5:
-            return ProgramStage::Compute;
-        case 6:
-            return ProgramStage::Task;
-        case 7:
-            return ProgramStage::Mesh;
-        default:
-            break;
-        }
-    }
-    const u32 type = HeaderType(code);
-    if (type < 1 || type > 5) {
-        return std::nullopt;
-    }
-    return GraphicsStages[type - 1];
-}
-
-/// Inflates a whole frame; one that doesn't declare its size is streamed up to MaxAllocation.
-std::vector<u8> InflateFrame(Bytes frame, const ZstdDictionaries* dictionaries) {
-    if (ZSTD_getFrameContentSize(frame.data(), frame.size()) != ZSTD_CONTENTSIZE_UNKNOWN) {
-        return ZstdDecompress(frame, dictionaries);
-    }
-    const unsigned id = ZSTD_getDictID_fromFrame(frame.data(), frame.size());
-    const ZSTD_DDict* const dictionary = id != 0 && dictionaries ? dictionaries->Find(id) : nullptr;
-    if (id != 0 && dictionary == nullptr) {
-        throw ArchiveError(fmt::format("zstd dictionary {} is required", id));
-    }
-    const std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> context{ZSTD_createDCtx(),
-                                                                      ZSTD_freeDCtx};
-    if (dictionary != nullptr) {
-        ZSTD_DCtx_refDDict(context.get(), dictionary);
-    }
-    std::vector<u8> out(size_t{1} << 16);
-    ZSTD_inBuffer in{frame.data(), frame.size(), 0};
-    size_t produced = 0;
-    for (;;) {
-        if (produced == out.size()) {
-            if (out.size() >= MaxAllocation) {
-                throw ArchiveError("excessive zstd decompressed size");
-            }
-            out.resize(std::min<size_t>(out.size() * 2, MaxAllocation));
-        }
-        ZSTD_outBuffer o{out.data() + produced, out.size() - produced, 0};
-        const size_t status = ZSTD_decompressStream(context.get(), &o, &in);
-        if (ZSTD_isError(status)) {
-            throw ArchiveError(
-                fmt::format("zstd decompression failed: {}", ZSTD_getErrorName(status)));
-        }
-        produced += o.pos;
-        if (status == 0) {
-            break;
-        }
-        if (in.pos == in.size && o.pos == 0) {
-            throw ArchiveError("truncated zstd frame");
-        }
-    }
-    out.resize(produced);
-    return out;
-}
-
-/// Whether `data` starts like a file WalkArchive reads.
-bool IsContainer(Bytes data) {
-    for (const std::string_view magic :
-         {std::string_view{"\x28\xb5\x2f\xfd"}, std::string_view{"DCX\0", 4},
-          std::string_view{"SARC"}, std::string_view{"BND4"}, std::string_view{"FSHA"},
-          std::string_view{"BNSH"}, std::string_view{"CGSB"}, std::string_view{"SHN!"},
-          std::string_view{"BAHS"}, std::string_view{"VFXB"}}) {
-        if (Is(data, 0, magic)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-} // Anonymous namespace
-
-void FindBarePrograms(std::span<const u8> data,
-                      const std::function<void(const ShaderRecord&)>& on_record) {
-    auto it = data.begin();
-    while ((it = std::search(it, data.end(), ControlMagic.begin(), ControlMagic.begin() + 4)) !=
-           data.end()) {
-        const size_t base = static_cast<size_t>(it - data.begin());
-        ++it;
-        if (data.size() - base < BareControlBytes || !IsControlMagic(data.subspan(base))) {
-            continue;
-        }
-        const size_t own = std::max<size_t>(Le<u32>(data, base + 0x30), BareControlBytes);
-        const size_t code_size = Le<u32>(data, base + 0x44);
-        if (code_size < 4 || own > data.size() - base || code_size > data.size() - base - own) {
-            continue;
-        }
-        const auto control = data.subspan(base, own);
-        const auto code = data.subspan(base + own, code_size);
-        const auto stage = BareStage(control, code);
-        if (!stage) {
-            continue;
-        }
-        on_record({*stage, code, control});
-        it = data.begin() + static_cast<std::ptrdiff_t>(base + own + code_size);
-    }
-}
-
-bool IsFramePack(std::span<const u8> head, std::string_view path, u64 size) {
-    if (Is(head, 0, "PDAT")) {
-        return true;
-    }
-    if (size < (u64{1} << 30)) {
-        return false;
-    }
-    const std::string lower = Lower(path);
-    for (const std::string_view media :
-         {".mp4", ".webm", ".mov", ".usm", ".bik", ".bfstm", ".bwav", ".bwsd", ".awb", ".acb"}) {
-        if (EndsWith(lower, media)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-FrameScanResult ScanFrames(u64 size, const ReadAt& read, const ZstdDictionaries* dictionaries,
-                           const std::function<void(const ShaderRecord&)>& on_record,
-                           std::stop_token stop, const FrameScanOptions& options) {
-    FrameScanResult result;
-    // Walks one whole frame; true when it inflated.
-    const auto take = [&](Bytes frame) {
-        try {
-            const auto inner = InflateFrame(frame, dictionaries);
-            if (IsContainer(inner)) {
-                WalkArchive(inner, "frame", dictionaries, on_record, [](const std::string&) {});
-            } else {
-                FindBarePrograms(inner, on_record);
-            }
-            ++result.frames;
-        } catch (const ArchiveError&) {
-            ++result.failed;
-        }
-    };
-    const size_t window_size = std::max<size_t>(options.window, ZstdMagic.size() * 2);
-    u64 offset = 0;
-    while (offset < size) {
-        if (stop.stop_requested()) {
-            result.stopped = true;
-            break;
-        }
-        const size_t asked = static_cast<size_t>(std::min<u64>(window_size, size - offset));
-        const auto window = read(offset, asked);
-        result.bytes_read += window.size();
-        if (window.size() < asked) {
-            result.read_failed = true;
-            break;
-        }
-        if (window.size() < ZstdMagic.size()) {
-            break;
-        }
-        const bool last = offset + window.size() >= size;
-        // Where the next window starts, relative to this one: past the last frame taken, and
-        // ZstdMagic.size() - 1 bytes before the end so that a magic cut by it is found there.
-        u64 next = last ? window.size() : window.size() - (ZstdMagic.size() - 1);
-        size_t base = 0;
-        while (base + ZstdMagic.size() <= window.size()) {
-            const auto found = std::search(window.begin() + static_cast<std::ptrdiff_t>(base),
-                                           window.end(), ZstdMagic.begin(), ZstdMagic.end());
-            if (found == window.end()) {
-                break;
-            }
-            base = static_cast<size_t>(found - window.begin());
-            const Bytes rest{window.data() + base, window.size() - base};
-            const size_t frame = ZSTD_findFrameCompressedSize(rest.data(), rest.size());
-            if (!ZSTD_isError(frame)) {
-                if (frame > options.max_frame) {
-                    ++result.oversized;
-                } else {
-                    take(rest.first(frame));
-                }
-                base += frame;
-                next = std::max<u64>(next, base);
-                continue;
-            }
-            if (last || ZSTD_getErrorCode(frame) != ZSTD_error_srcSize_wrong) {
-                ++base; // a stray magic, or a frame that doesn't parse
-                continue;
-            }
-            if (base != 0) {
-                next = base; // the frame runs past the window: the next one starts with it
-                break;
-            }
-            // A frame larger than the window: read on its own, up to max_frame. One that declares
-            // its content size is first read to the size a single-pass compressor gives it at
-            // most, and again up to max_frame when it is larger (many small blocks).
-            const u64 limit = std::min<u64>(options.max_frame, size - offset);
-            if (limit <= window.size()) {
-                ++result.oversized;
-                ++base;
-                continue;
-            }
-            u64 length = limit;
-            const unsigned long long content = ZSTD_getFrameContentSize(rest.data(), rest.size());
-            if (content != ZSTD_CONTENTSIZE_UNKNOWN && content != ZSTD_CONTENTSIZE_ERROR) {
-                const u64 estimate =
-                    ZSTD_compressBound(static_cast<size_t>(std::min<u64>(content, MaxAllocation))) +
-                    MaxFrameOverhead;
-                if (estimate > window.size() && estimate < limit) {
-                    length = estimate;
-                }
-            }
-            std::vector<u8> whole;
-            size_t large = 0;
-            for (;;) {
-                whole = read(offset, static_cast<size_t>(length));
-                result.bytes_read += whole.size();
-                if (whole.size() < length) {
-                    result.read_failed = true;
-                    return result;
-                }
-                large = ZSTD_findFrameCompressedSize(whole.data(), whole.size());
-                if (!ZSTD_isError(large) || ZSTD_getErrorCode(large) != ZSTD_error_srcSize_wrong ||
-                    length == limit) {
-                    break;
-                }
-                length = limit;
-            }
-            if (ZSTD_isError(large)) {
-                if (ZSTD_getErrorCode(large) == ZSTD_error_srcSize_wrong) {
-                    ++result.oversized;
-                }
-                ++base;
-                continue;
-            }
-            take(Bytes{whole}.first(large));
-            next = large;
-            break;
-        }
-        offset += next;
-    }
-    return result;
+void WalkArchive(std::span<const u8> data, const std::string& name,
+                 const ZstdDictionaries* dictionaries,
+                 const std::function<void(const ShaderRecord&)>& on_record,
+                 const std::function<void(const ShaderPairRecord&)>& on_pair,
+                 const std::function<void(const std::string&)>& on_member_error) {
+    const Walker walker{dictionaries, on_record, &on_pair, on_member_error};
+    walker.Walk(data, name, 0);
 }
 
 } // namespace VideoCommon::ShaderWarm

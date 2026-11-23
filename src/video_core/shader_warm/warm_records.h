@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "shader_recompiler/program_header.h"
 #include "video_core/pipeline_cache_files.h"
 
 namespace VideoCommon::ShaderWarm {
@@ -23,9 +24,17 @@ constexpr u32 WarmCacheVersion = VideoCommon::VulkanPipelineCacheVersion;
 
 /// What the builder finds in the game files, recorded in the precache's count file. A file built by
 /// an older builder is built again at launch (WarmFilesStale). 2: Mario Kart World's .esetb
-/// effects. 3: .ptcl particle effects (Fire Emblem). 4: bare programs in the zstd frames of asset
-/// packs (Kirby Air Riders).
-constexpr u32 WarmBuilderVersion = 4;
+/// effects. 3: .ptcl particle effects (Fire Emblem). 4: RomFS graphics shader extraction into
+/// shader cache v2. 5: Full Ahead-of-Time RomFS Graphics Pipeline Pairs Extraction (BNSH variation tables & warm-pairs.bin)
+/// 6: Serialize exact ProgramHeader in warm-pairs.bin for complete Vulkan pipeline precaching.
+/// 7: Align start_address to 0 and supply true local_memory_size from SPH for graphics pairs.
+constexpr u32 WarmBuilderVersion = 7;
+
+struct WarmGraphicsPair {
+    u64 vs_hash{};
+    u64 ps_hash{};
+    u32 flags{};
+};
 
 using ComputeKey = std::array<u8, 24>;
 
@@ -33,6 +42,7 @@ using ComputeKey = std::array<u8, 24>;
 /// with the same functions (video_core/native_lowering.h).
 struct LoweredCode {
     std::vector<u8> code;
+    Shader::ProgramHeader sph{};
     /// Constant buffer the program's bound textures read, ~0U when it names none.
     u32 texture_buffer{~0U};
 };
@@ -59,5 +69,9 @@ std::optional<ComputeControl> ReadComputeControl(std::span<const u8> control);
 /// One compute entry (env count, env, code, compute trailer, key); `key` gets the 24-byte key.
 std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& control,
                              ComputeKey& key);
+
+/// One graphics pair entry (env count = 2, vs env + code, ps env + code, stage hashes).
+std::vector<u8> GraphicsPairEntry(const LoweredCode& vs_lowered, const LoweredCode& ps_lowered,
+                                  u64 vs_hash, u64 ps_hash);
 
 } // namespace VideoCommon::ShaderWarm

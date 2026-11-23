@@ -3,8 +3,10 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstring>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "common/assert.h"
@@ -316,6 +318,25 @@ bool DecoderContext::OpenContext(const Decoder& decoder, std::span<const u8> ext
         }
         std::memcpy(m_codec_context->extradata, extradata.data(), extradata.size());
         m_codec_context->extradata_size = static_cast<int>(extradata.size());
+    }
+
+    if (m_codec_context->hw_device_ctx == nullptr) {
+        const u32 hw_threads = std::max(std::thread::hardware_concurrency(), 2u);
+        if (hw_threads <= 6) {
+            m_codec_context->thread_count = 2;
+        } else if (hw_threads <= 8) {
+            m_codec_context->thread_count = 3;
+        } else {
+            m_codec_context->thread_count = static_cast<int>(std::clamp<u32>(hw_threads / 3, 3u, 6u));
+        }
+        if (decoder.GetCodec() != nullptr &&
+            std::string_view{decoder.GetCodec()->name} == "libdav1d" &&
+            m_codec_context->priv_data != nullptr) {
+            const char* frame_delay = hw_threads <= 6 ? "2" : "4";
+            av_opt_set(m_codec_context->priv_data, "framethreads", frame_delay, 0);
+            av_opt_set(m_codec_context->priv_data, "max_frame_delay", frame_delay, 0);
+            av_opt_set(m_codec_context->priv_data, "tilethreads", "1", 0);
+        }
     }
 
     if (const int ret = avcodec_open2(m_codec_context, decoder.GetCodec(), nullptr); ret < 0) {

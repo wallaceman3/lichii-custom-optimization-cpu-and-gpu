@@ -16,6 +16,7 @@ on:
       - nx2-experimental
       - dynarmic_cpu_optimizations
       - build-1.14-optimized
+      - diag/**
     # A binary only changes when build inputs change; docs-only pushes skip the build.
     paths:
       - "src/**"
@@ -92,11 +93,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Windows PGO only (isolated for fast builds, zero queue delay and 100% dedicated sccache)
-          - platform: windows-x86_64-pgo
+          # Build A (Diagnostic - Release Standard without PGO for fast CI turnaround)
+          - platform: windows-x86_64
             runner: windows-2022
-            pgo: true
-            profile: lichii-windows.profdata
+            pgo: false
           # Other platforms (re-enable when releasing full multi-platform packages):
           # - platform: windows-x86_64
           #   runner: windows-2022

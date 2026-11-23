@@ -195,14 +195,15 @@ void ShaderWarmDialog::OnFinished(const ShaderWarm::Result& result, bool stopped
     QString text;
     if (result.ok) {
         stage_label->setText(tr("Shader precache is ready."));
-        if (result.compute_programs == 0) {
-            text = result.archives == 0 && result.packs == 0
+        if (result.compute_programs == 0 && result.graphics_programs == 0) {
+            text = result.archives == 0
                        ? tr("This game keeps its shaders in a format Lichii can't read, so none "
                             "are prepared from the game files.")
-                       : tr("The game files have no compute shaders to prepare.");
+                       : tr("The game files have no shaders to prepare.");
         } else {
-            text = tr("Compute programs: %L1")
-                       .arg(static_cast<qulonglong>(result.compute_programs));
+            text = tr("Compute programs: %L1\nGraphics programs: %L2")
+                       .arg(static_cast<qulonglong>(result.compute_programs))
+                       .arg(static_cast<qulonglong>(result.graphics_programs));
         }
         if (result.skipped > 0) {
             text += QLatin1Char('\n') +
