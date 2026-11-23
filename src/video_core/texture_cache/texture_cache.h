@@ -519,6 +519,59 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory, bool at_critical) 
 }
 
 template <class P>
+void TextureCache<P>::PurgeStaleImagesOnSceneChange() {
+    if (!Settings::values.purge_stale_on_scene_change.GetValue()) {
+        return;
+    }
+    if (is_purging) {
+        return;
+    }
+    is_purging = true;
+
+    const StutterTrace::SiteScope site{StutterTrace::Site::TextureCollect};
+
+    if constexpr (requires { runtime.Finish(); }) {
+        runtime.Finish();
+    }
+    if constexpr (requires { runtime.CurrentTick(); }) {
+        while (!gpu_sentenced_images.empty() &&
+               runtime.IsFree(gpu_sentenced_images.front().tick)) {
+            gpu_sentenced_bytes -= gpu_sentenced_images.front().bytes;
+            gpu_sentenced_images.pop_front();
+        }
+    }
+
+    for (size_t i = 0; i < TICKS_TO_DESTROY; ++i) {
+        sentenced_images.Tick();
+        sentenced_framebuffers.Tick();
+        sentenced_image_view.Tick();
+        sentenced_image_bytes[i] = 0;
+    }
+
+    boost::container::small_vector<ImageId, 64> stale_candidates;
+    for (const auto [image_id, image] : slot_images) {
+        if (True(image->flags & ImageFlagBits::BadOverlap) &&
+            False(image->flags & ImageFlagBits::IsDecoding)) {
+            stale_candidates.push_back(image_id);
+        }
+    }
+    for (const ImageId image_id : stale_candidates) {
+        if (slot_images.contains(image_id)) {
+            auto& image = slot_images[image_id];
+            if (True(image.flags & ImageFlagBits::Tracked)) {
+                UntrackImage(image, image_id);
+            }
+            UnregisterImage(image_id);
+            trace_delete_reason = "purge-stale-scene";
+            DeleteImage(image_id, true);
+        }
+    }
+
+    device_memory.TrimZeroPages();
+    is_purging = false;
+}
+
+template <class P>
 bool TextureCache<P>::OverlapHasNewerData(ImageId image_id, const ImageBase& image,
                                           KeepRanges& keep,
                                           WritebackRanges::TickedRanges* keep_ticks) {

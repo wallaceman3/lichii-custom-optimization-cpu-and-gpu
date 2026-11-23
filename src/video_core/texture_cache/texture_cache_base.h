@@ -516,6 +516,11 @@ public:
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
 
+    /// Purges superseded images, flushes delayed destruction rings, and trims zero pages on scene transitions.
+    void PurgeStaleImagesOnSceneChange();
+
+    bool is_purging{false};
+
     Common::SpinRecursiveMutex mutex;
 
 private:
